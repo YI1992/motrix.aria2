@@ -66,9 +66,11 @@ test -z "$TLS_BACKEND" && TLS_BACKEND=openssl
 case "$TLS_BACKEND" in
 openssl)
   TLS_OPTIONS="--without-wintls --with-openssl"
+  OPENSSL_CPPFLAGS="-DARIA2_MOTRIX_HERMETIC_OPENSSL=1"
   ;;
 wintls)
   TLS_OPTIONS="--with-wintls --without-openssl"
+  OPENSSL_CPPFLAGS=""
   ;;
 *)
   echo "Unsupported TLS_BACKEND: $TLS_BACKEND" >&2
@@ -94,7 +96,7 @@ esac
     --without-libnettle \
     --with-cppunit-prefix=$PREFIX \
     ARIA2_STATIC=yes \
-    CPPFLAGS="-I$PREFIX/include" \
+    CPPFLAGS="$OPENSSL_CPPFLAGS -I$PREFIX/include" \
     LDFLAGS="-L$PREFIX/lib" \
     PKG_CONFIG="/usr/bin/pkg-config" \
     PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig" \

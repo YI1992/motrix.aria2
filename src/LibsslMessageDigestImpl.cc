@@ -35,12 +35,42 @@
 
 #include "MessageDigestImpl.h"
 
+#include <openssl/err.h>
 #include <openssl/evp.h>
 
 #include "Adler32MessageDigestImpl.h"
+#include "FatalException.h"
+#include "fmt.h"
 #include "libssl_compat.h"
 
 namespace aria2 {
+
+namespace {
+void checkOpenSSL(int result, const char* operation)
+{
+  if (result == 1) {
+    return;
+  }
+
+  auto error = ERR_get_error();
+  if (error == 0) {
+    throw FATAL_EXCEPTION(
+        fmt("%s failed: OpenSSL returned no error detail", operation));
+  }
+  char errorString[256];
+  ERR_error_string_n(error, errorString, sizeof(errorString));
+  throw FATAL_EXCEPTION(fmt("%s failed: %s", operation, errorString));
+}
+
+size_t digestLength(const EVP_MD* md)
+{
+  if (md == nullptr) {
+    return 0;
+  }
+  auto len = EVP_MD_size(md);
+  return len > 0 ? static_cast<size_t>(len) : 0;
+}
+} // namespace
 
 #if !OPENSSL_101_API
 namespace {
@@ -64,30 +94,55 @@ template <const EVP_MD* (*init_fn)()>
 class MessageDigestBase : public MessageDigestImpl {
 public:
   MessageDigestBase()
-      : ctx_(EVP_MD_CTX_new()), md_(init_fn()), len_(EVP_MD_size(md_))
+      : ctx_(EVP_MD_CTX_new()),
+        md_(init_fn()),
+        len_(digestLength(md_))
   {
-    EVP_MD_CTX_reset(ctx_);
-    reset();
+    if (ctx_ == nullptr || md_ == nullptr || len_ == 0) {
+      EVP_MD_CTX_free(ctx_);
+      ctx_ = nullptr;
+      throw FATAL_EXCEPTION("Failed to create OpenSSL message digest context");
+    }
+    try {
+      checkOpenSSL(EVP_MD_CTX_reset(ctx_), "EVP_MD_CTX_reset");
+      reset();
+    }
+    catch (...) {
+      EVP_MD_CTX_free(ctx_);
+      ctx_ = nullptr;
+      throw;
+    }
   }
   virtual ~MessageDigestBase() { EVP_MD_CTX_free(ctx_); }
 
-  static size_t length() { return EVP_MD_size(init_fn()); }
+  static size_t length()
+  {
+    return digestLength(init_fn());
+  }
   virtual size_t getDigestLength() const CXX11_OVERRIDE { return len_; }
-  virtual void reset() CXX11_OVERRIDE { EVP_DigestInit_ex(ctx_, md_, nullptr); }
+  virtual void reset() CXX11_OVERRIDE
+  {
+    checkOpenSSL(EVP_DigestInit_ex(ctx_, md_, nullptr), "EVP_DigestInit_ex");
+  }
   virtual void update(const void* data, size_t length) CXX11_OVERRIDE
   {
     auto bytes = reinterpret_cast<const char*>(data);
     while (length) {
       size_t l = std::min(length, (size_t)std::numeric_limits<uint32_t>::max());
-      EVP_DigestUpdate(ctx_, bytes, l);
+      checkOpenSSL(EVP_DigestUpdate(ctx_, bytes, l), "EVP_DigestUpdate");
       length -= l;
       bytes += l;
     }
   }
   virtual void digest(unsigned char* md) CXX11_OVERRIDE
   {
-    unsigned int len;
-    EVP_DigestFinal_ex(ctx_, md, &len);
+    unsigned int len = 0;
+    checkOpenSSL(EVP_DigestFinal_ex(ctx_, md, &len), "EVP_DigestFinal_ex");
+    if (len != len_) {
+      throw FATAL_EXCEPTION(fmt("OpenSSL message digest length mismatch: "
+                                "expected %zu, got %u",
+                                len_, len));
+    }
   }
 
 private:

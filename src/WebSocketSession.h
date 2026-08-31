@@ -74,7 +74,7 @@ public:
   int onWriteEvent();
   // Adds text message |msg|. The message is queued and will be sent
   // in onWriteEvent().
-  void addTextMessage(const std::string& msg, bool delayed);
+  bool addTextMessage(const std::string& msg, bool delayed);
   // Returns true if the close frame is received.
   bool closeReceived();
   // Returns true if the close frame is sent.
@@ -105,12 +105,18 @@ public:
 
   void markAuthorized() { authorized_ = true; }
 
+  void recordWriteResult(size_t attempted, ssize_t sent);
+
 private:
   std::shared_ptr<SocketCore> socket_;
   DownloadEngine* e_;
   wslay_event_context_ptr wsctx_;
   bool ignorePayload_;
   bool authorized_;
+  bool queueFailed_;
+  bool firstMessageQueued_;
+  bool firstMessageSent_;
+  bool writeBlockedLogged_;
   int32_t receivedLength_;
   json::ValueBaseJsonParser parser_;
   WebSocketInteractionCommand* command_;

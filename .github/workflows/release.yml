@@ -7,7 +7,7 @@ on:
     inputs:
       version:
         description: 'Version for a dry run (no leading v)'
-        default: '1.37.0-motrix.0-dev'
+        default: '1.37.0-motrix.11-dev'
 
 permissions:
   contents: write
@@ -50,7 +50,7 @@ jobs:
       uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: build-release/arch
-        key: osx-deps-${{ matrix.arch }}-${{ hashFiles('makerelease-osx.mk') }}
+        key: osx-deps-${{ matrix.arch }}-${{ hashFiles('makerelease-osx.mk', 'scripts/ci/deps.env', 'patches/libssh2-*.patch') }}
     - name: Build deps if not cached
       run: |
         brew install autoconf automake libtool pkg-config gettext
@@ -101,13 +101,19 @@ jobs:
 
   windows-smoke:
     needs: [version, windows]
-    runs-on: windows-2025
     strategy:
       fail-fast: false
       matrix:
-        asset_arch: [x64, ia32]
+        include:
+        - { asset_arch: x64, runner: windows-2022 }
+        - { asset_arch: x64, runner: windows-2025 }
+        - { asset_arch: ia32, runner: windows-2025 }
+    runs-on: ${{ matrix.runner }}
     steps:
     - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+    - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      with:
+        node-version: 24
     - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
       with:
         name: win32-${{ matrix.asset_arch }}
@@ -150,6 +156,73 @@ jobs:
             throw "HTTPS smoke failed for $url (exit $LASTEXITCODE)"
           }
         }
+    - name: Record candidate identity
+      shell: pwsh
+      run: |
+        $resultDir = 'test-results/ws-contract'
+        New-Item -ItemType Directory -Force -Path $resultDir | Out-Null
+        Get-FileHash -Algorithm SHA256 .\bin\aria2c.exe |
+          Format-List | Out-File "$resultDir/binary-sha256.txt"
+        (& .\bin\aria2c.exe --version 2>&1 | Out-String) |
+          Out-File "$resultDir/version.txt"
+    - name: Verify persistent WebSocket RPC
+      env:
+        ARIA2_E2E_BIN: ${{ github.workspace }}\bin\aria2c.exe
+        ARIA2_E2E_KEEP_TMP: '1'
+        ARIA2_E2E_WORK_DIR: ${{ github.workspace }}\test-results\ws-contract\runs
+      run: node --test test/e2e/websocket-rpc-contract.e2e.test.mjs
+    - name: Upload WebSocket diagnostics
+      if: failure()
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: ws-contract-${{ matrix.asset_arch }}-${{ matrix.runner }}
+        path: test-results/ws-contract
+        if-no-files-found: error
+
+  motrix-windows-consumer:
+    needs: windows
+    runs-on: windows-2025
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        repository: agalwood/Motrix
+        ref: 75dcb03c9a53777ccb58cb9553514cdb44f20f15
+        path: Motrix
+    - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+      with:
+        version: 11.22.0
+        run_install: false
+    - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      with:
+        node-version: 24
+        cache: pnpm
+        cache-dependency-path: Motrix/pnpm-lock.yaml
+    - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      with:
+        name: win32-x64
+        path: dist
+    - name: Inject candidate engine
+      shell: pwsh
+      run: |
+        $archive = Get-ChildItem -Path dist -Filter '*.zip' | Select-Object -First 1
+        if (-not $archive) { throw 'Windows aria2 archive was not downloaded' }
+        Expand-Archive -LiteralPath $archive.FullName -DestinationPath engine
+        $targetDir = 'Motrix/extra/win32/x64'
+        New-Item -ItemType Directory -Force -Path $targetDir | Out-Null
+        Copy-Item .\engine\aria2c.exe "$targetDir/aria2c.exe"
+    - name: Install Motrix dependencies
+      working-directory: Motrix
+      env:
+        MOTRIX_SKIP_ELECTRON_REBUILD: '1'
+        MOTRIX_SKIP_ENGINE_FETCH: '1'
+      run: pnpm install --frozen-lockfile
+    - name: Verify Motrix WebSocket consumer
+      working-directory: Motrix
+      run: >-
+        pnpm exec vitest run
+        src/core/engine/aria2/aria2-adapter.integration.test.ts
+        --reporter=verbose
+        -t "addTorrent select-file marks only requested files as selected"
 
   linux:
     needs: version
@@ -209,7 +282,7 @@ jobs:
         path: aria2c-*-android-arm.tar.gz
 
   publish:
-    needs: [macos, windows-smoke, linux, android]
+    needs: [macos, windows-smoke, motrix-windows-consumer, linux, android]
     if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     steps:
@@ -221,8 +294,30 @@ jobs:
       env:
         GH_TOKEN: ${{ github.token }}
       run: |
-        gh release create "${GITHUB_REF_NAME}" dist/* \
-          --repo "${GITHUB_REPOSITORY}" \
-          --title "${GITHUB_REF_NAME}" \
-          --notes "aria2 fork build for Motrix. Base: upstream 1.37.0." \
-          || gh release upload "${GITHUB_REF_NAME}" dist/* --repo "${GITHUB_REPOSITORY}" --clobber
+        printf '%s\n' \
+          'aria2 fork build for Motrix. Base: upstream 1.37.0.' \
+          '' \
+          'Highlights:' \
+          '- Fix persistent WebSocket JSON-RPC responses on affected Windows systems (#2027, #2029).' \
+          '- Isolate the static Windows OpenSSL runtime from machine-wide OpenSSL configuration.' \
+          '- Upgrade OpenSSL to 3.5.8 LTS and libgcrypt to 1.12.3.' \
+          '- Backport the current libssh2 1.11.1 security fixes used by this build.' \
+          '- Add release-gating WebSocket tests on Windows Server 2022/2025, x64 and ia32.' \
+          '' \
+          'All attached archives are covered by SHA256SUMS.' \
+          > release-notes.md
+
+        if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+          gh release edit "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file release-notes.md
+          gh release upload "${GITHUB_REF_NAME}" dist/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --clobber
+        else
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file release-notes.md
+        fi

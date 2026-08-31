@@ -203,8 +203,79 @@ jobs:
           throw 'WinTLS smoke encountered SEC_E_ILLEGAL_MESSAGE (0x80090326)'
         }
 
+  windows-release-build:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - { host: x86_64-w64-mingw32, asset_arch: x64 }
+        - { host: i686-w64-mingw32,   asset_arch: ia32 }
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - name: Build release-equivalent OpenSSL binary
+      run: |
+        docker build \
+          -f Dockerfile.mingw \
+          --build-arg HOST=${{ matrix.host }} \
+          --build-arg TLS_BACKEND=openssl \
+          -t aria2-mingw-openssl-${{ matrix.asset_arch }}-ci .
+        id=$(docker create aria2-mingw-openssl-${{ matrix.asset_arch }}-ci)
+        docker cp "$id:/aria2/src/aria2c.exe" ./aria2c.exe
+        docker rm "$id"
+        zip -j "aria2c-win32-${{ matrix.asset_arch }}.zip" aria2c.exe
+    - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: openssl-win32-${{ matrix.asset_arch }}
+        path: aria2c-win32-${{ matrix.asset_arch }}.zip
+
+  windows-ws-contract:
+    needs: windows-release-build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - { asset_arch: x64, runner: windows-2022 }
+        - { asset_arch: x64, runner: windows-2025 }
+        - { asset_arch: ia32, runner: windows-2025 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      with:
+        node-version: 24
+    - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      with:
+        name: openssl-win32-${{ matrix.asset_arch }}
+        path: dist
+    - name: Extract candidate and record its identity
+      shell: pwsh
+      run: |
+        $archive = Get-ChildItem -Path dist -Filter '*.zip' | Select-Object -First 1
+        if (-not $archive) { throw 'Windows aria2 archive was not downloaded' }
+        Expand-Archive -LiteralPath $archive.FullName -DestinationPath bin
+        $resultDir = 'test-results/ws-contract'
+        New-Item -ItemType Directory -Force -Path $resultDir | Out-Null
+        Get-FileHash -Algorithm SHA256 .\bin\aria2c.exe |
+          Format-List | Out-File "$resultDir/binary-sha256.txt"
+        (& .\bin\aria2c.exe --version 2>&1 | Out-String) |
+          Out-File "$resultDir/version.txt"
+    - name: Verify persistent WebSocket RPC
+      env:
+        ARIA2_E2E_BIN: ${{ github.workspace }}\bin\aria2c.exe
+        ARIA2_E2E_KEEP_TMP: '1'
+        ARIA2_E2E_WORK_DIR: ${{ github.workspace }}\test-results\ws-contract\runs
+      run: node --test test/e2e/websocket-rpc-contract.e2e.test.mjs
+    - name: Upload WebSocket diagnostics
+      if: failure()
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: ws-contract-${{ matrix.asset_arch }}-${{ matrix.runner }}
+        path: test-results/ws-contract
+        if-no-files-found: error
+
   ci-required:
-    needs: [build, wintls-smoke]
+    needs: [build, wintls-smoke, windows-release-build, windows-ws-contract]
     if: always()
     runs-on: ubuntu-24.04
     steps:
@@ -216,6 +287,14 @@ jobs:
         fi
         if [ "${{ needs.wintls-smoke.result }}" != "success" ]; then
           echo "WinTLS smoke result: ${{ needs.wintls-smoke.result }}"
+          exit 1
+        fi
+        if [ "${{ needs.windows-release-build.result }}" != "success" ]; then
+          echo "Windows OpenSSL build result: ${{ needs.windows-release-build.result }}"
+          exit 1
+        fi
+        if [ "${{ needs.windows-ws-contract.result }}" != "success" ]; then
+          echo "Windows WebSocket contract result: ${{ needs.windows-ws-contract.result }}"
           exit 1
         fi
         echo "all required jobs passed"

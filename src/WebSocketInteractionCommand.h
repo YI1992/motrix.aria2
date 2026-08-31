@@ -67,6 +67,11 @@ public:
   std::shared_ptr<WebSocketSession>& getSession() { return wsSession_; }
 
   void updateWriteCheck();
+
+  // A response may be queued by a receive callback or by a delayed auth
+  // response command.  Wake this command explicitly so delivery never waits
+  // for an unrelated socket edge or the periodic full command scan.
+  void messageQueued();
 };
 
 } // namespace rpc

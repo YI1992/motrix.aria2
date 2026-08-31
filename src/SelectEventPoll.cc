@@ -172,37 +172,50 @@ void SelectEventPoll::poll(const struct timeval& tv)
   fd_set rfds;
   fd_set wfds;
 
-  memcpy(&rfds, &rfdset_, sizeof(fd_set));
-  memcpy(&wfds, &wfdset_, sizeof(fd_set));
-
 #ifdef __MINGW32__
   fd_set efds;
-  memcpy(&efds, &wfdset_, sizeof(fd_set));
+#endif // __MINGW32__
+  int retval;
+#ifdef __MINGW32__
+  int selectError = 0;
+#endif // __MINGW32__
+  do {
+    // select() may modify all fd_sets even when it fails. Rebuild them before
+    // every interrupted retry rather than carrying indeterminate state into
+    // the next call.
+    memcpy(&rfds, &rfdset_, sizeof(fd_set));
+    memcpy(&wfds, &wfdset_, sizeof(fd_set));
+#ifdef __MINGW32__
+    memcpy(&efds, &wfdset_, sizeof(fd_set));
 #endif // __MINGW32__
 
 #ifdef ENABLE_ASYNC_DNS
-
-  for (auto& i : nameResolverEntries_) {
-    auto& entry = i.second;
-    auto fd = entry.getFds(&rfds, &wfds);
-    // TODO force error if fd == 0
-    if (fdmax_ < fd) {
-      fdmax_ = fd;
+    for (auto& i : nameResolverEntries_) {
+      auto& entry = i.second;
+      auto fd = entry.getFds(&rfds, &wfds);
+      // TODO force error if fd == 0
+      if (fdmax_ < fd) {
+        fdmax_ = fd;
+      }
     }
-  }
-
 #endif // ENABLE_ASYNC_DNS
-  int retval;
-  do {
+
     struct timeval ttv = tv;
 #ifdef __MINGW32__
     // winsock will report non-blocking connect() errors in efds,
     // unlike posix, which will mark such sockets as writable.
     retval = select(fdmax_ + 1, &rfds, &wfds, &efds, &ttv);
+    // errno belongs to the C runtime and is not defined by Winsock calls.
+    // Save the Winsock error immediately; another socket call may overwrite it.
+    selectError = retval == SOCKET_ERROR ? WSAGetLastError() : 0;
 #else  // !__MINGW32__
     retval = select(fdmax_ + 1, &rfds, &wfds, nullptr, &ttv);
 #endif // !__MINGW32__
+#ifdef __MINGW32__
+  } while (retval == SOCKET_ERROR && selectError == WSAEINTR);
+#else  // !__MINGW32__
   } while (retval == -1 && errno == EINTR);
+#endif // !__MINGW32__
   if (retval > 0) {
     for (auto& i : socketEntries_) {
       auto& e = i.second;
@@ -222,9 +235,14 @@ void SelectEventPoll::poll(const struct timeval& tv)
     }
   }
   else if (retval == -1) {
+#ifdef __MINGW32__
+    A2_LOG_INFO(fmt("select error: %s, fdmax: %d",
+                    util::formatLastError(selectError).c_str(), fdmax_));
+#else  // !__MINGW32__
     int errNum = errno;
     A2_LOG_INFO(fmt("select error: %s, fdmax: %d",
                     util::safeStrerror(errNum).c_str(), fdmax_));
+#endif // !__MINGW32__
   }
 #ifdef ENABLE_ASYNC_DNS
 

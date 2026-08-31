@@ -78,7 +78,7 @@ else
 ifeq ($(NON_RELEASE),force)
 	VERSION := $(BASE_VERSION)
 else
-	VERSION := $(subst release-,,$(shell git describe --tags))
+	VERSION := $(subst release-,,$(shell git -C $(SRCDIR) describe --tags))
 endif
 endif
 
@@ -148,7 +148,7 @@ libgpgerror_ldflags=$(CFLAGS) $(LTO_FLAGS)
 libgpgerror_confflags = --with-pic --disable-languages --disable-doc --disable-nls
 
 libgcrypt_version = $(LIBGCRYPT_VERSION)
-libgcrypt_hash = 2c6d562e894b2b06eefbc427d12d51ee9d3e50e90012ad6596b4cb3e421a95f2
+libgcrypt_hash = 98d1b0b3202d2b03fa754a35aa3cbbfcf526a3260d8d2ee213748001b1043006
 libgcrypt_url = https://gnupg.org/ftp/gcrypt/libgcrypt/libgcrypt-$(libgcrypt_version).tar.bz2
 libgcrypt_confflags=--with-gpg-error-prefix=$(PWD)/arch --disable-O-flag-munging --disable-asm
 libgcrypt_cflags=$(PLATFORMFLAGS)
@@ -165,7 +165,8 @@ libssh2_confflags = --with-pic --with-crypto=libgcrypt --with-libgcrypt-prefix=$
 # drop these when LIBSSH2_VERSION moves past 1.11.1.
 libssh2_patches = \
 	$(SRCDIR)/patches/libssh2-$(libssh2_version)-cve-2026-55199.patch \
-	$(SRCDIR)/patches/libssh2-$(libssh2_version)-cve-2026-55200.patch
+	$(SRCDIR)/patches/libssh2-$(libssh2_version)-cve-2026-55200.patch \
+	$(SRCDIR)/patches/libssh2-$(libssh2_version)-security-rollup-2026.patch
 libssh2_nocheck = yes
 # sqlite 3.51+ autoconf amalgamation drops the `check` target in Makefile.in,
 # so skip per-dep `make check`. TCL-based tests need a separate harness.
@@ -185,8 +186,8 @@ NONARCHLIBS = zlib
 
 
 # Tags
-THIS_TAG := $(shell git describe --abbrev=0 $$(git rev-list --tags --max-count=1))
-PREV_TAG := $(shell git describe --abbrev=0 $(THIS_TAG)~1)
+THIS_TAG := $(shell git -C $(SRCDIR) describe --abbrev=0 $$(git -C $(SRCDIR) rev-list --tags --max-count=1))
+PREV_TAG := $(shell git -C $(SRCDIR) describe --abbrev=0 $(THIS_TAG)~1)
 
 
 # Aria2 setup
@@ -419,7 +420,7 @@ aria2.build: aria2.$(NATIVE_ARCH).build
 	touch $@
 
 $(ARIA2_CHANGELOG): aria2.$(NATIVE_ARCH).build
-	git log --pretty=fuller --date=short $(PREV_TAG)..HEAD > $@
+	git -C $(SRCDIR) log --pretty=fuller --date=short $(PREV_TAG)..HEAD > $@
 
 $(ARIA2_DOCS): aria2.$(NATIVE_ARCH).build
 	cp -av $(SRCDIR)/$(@F) $@

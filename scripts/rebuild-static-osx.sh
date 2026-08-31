@@ -85,7 +85,6 @@ done
 
 require_cmd make
 require_cmd ln
-require_cmd python3
 require_cmd sysctl
 
 if [[ "${DO_PACKAGE}" -eq 1 ]]; then
@@ -104,9 +103,10 @@ if [[ "${DO_CLEAN}" -eq 1 ]]; then
 fi
 
 mkdir -p "${BUILD_DIR}"
-REL_MAKEFILE="$(python3 -c 'import os,sys; print(os.path.relpath(sys.argv[1], sys.argv[2]))' \
-  "${MAKEFILE_PATH}" "${BUILD_DIR}")"
-ln -sfn "${REL_MAKEFILE}" "${MAKEFILE_LINK}"
+# Use an absolute target.  On macOS /tmp is a symlink to /private/tmp, so a
+# relative path computed from the lexical /tmp name can resolve under
+# /private/Users and leave an otherwise valid out-of-tree build unusable.
+ln -sfn "${MAKEFILE_PATH}" "${MAKEFILE_LINK}"
 
 if [[ -f "${ROOT_DIR}/config.status" ]]; then
   echo "==> Source tree has in-tree configure state; running make distclean"

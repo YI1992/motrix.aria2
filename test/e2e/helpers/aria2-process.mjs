@@ -44,13 +44,14 @@ export function buildArgs({
   logLevel = 'info',
   extra = [],
 }) {
+  const rpcAuthArgs = rpcSecret ? [`--rpc-secret=${rpcSecret}`] : []
   return [
     // engine binding
     '--enable-rpc=true',
     '--rpc-allow-origin-all=true',
     '--rpc-listen-all=false',
     `--rpc-listen-port=${rpcPort}`,
-    `--rpc-secret=${rpcSecret}`,
+    ...rpcAuthArgs,
     `--listen-port=${listenPort}`,
     `--dht-listen-port=${dhtListenPort}`,
     // for the e2e we keep DHT/PEX/LPD on; web-seed delivers data either way,

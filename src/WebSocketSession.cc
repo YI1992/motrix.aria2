@@ -63,6 +63,7 @@ ssize_t sendCallback(wslay_event_context_ptr wsctx, const uint8_t* data,
   const std::shared_ptr<SocketCore>& socket = session->getSocket();
   try {
     ssize_t r = socket->writeData(data, len);
+    session->recordWriteResult(len, r);
     if (r == 0) {
       if (socket->wantRead() || socket->wantWrite()) {
         wslay_event_set_error(wsctx, WSLAY_ERR_WOULDBLOCK);
@@ -75,7 +76,7 @@ ssize_t sendCallback(wslay_event_context_ptr wsctx, const uint8_t* data,
     return r;
   }
   catch (RecoverableException& e) {
-    A2_LOG_DEBUG_EX(EX_EXCEPTION_CAUGHT, e);
+    A2_LOG_WARN_EX("RPC-DIAG WebSocket send failed", e);
     wslay_event_set_error(wsctx, WSLAY_ERR_CALLBACK_FAILURE);
     return -1;
   }
@@ -168,50 +169,50 @@ void onMsgRecvCallback(wslay_event_context_ptr wsctx,
                        void* userData)
 {
   WebSocketSession* wsSession = reinterpret_cast<WebSocketSession*>(userData);
-  if (!wslay_is_ctrl_frame(arg->opcode)) {
-    // TODO Only process text frame
-    ssize_t error = 0;
-    auto json = wsSession->parseFinal(nullptr, 0, error);
-    if (error < 0) {
-      A2_LOG_INFO("Failed to parse JSON-RPC request");
-      RpcResponse res(
-          createJsonRpcErrorResponse(-32700, "Parse error.", Null::g()));
-      addResponse(wsSession, res);
-      return;
-    }
-    Dict* jsondict = downcast<Dict>(json);
-    auto e = wsSession->getDownloadEngine();
-    if (jsondict) {
-      RpcResponse res = processJsonRpcRequest(jsondict, e);
-      addResponse(wsSession, res);
-    }
-    else {
-      List* jsonlist = downcast<List>(json);
-      if (jsonlist) {
-        // This is batch call
-        std::vector<RpcResponse> results;
-        for (List::ValueType::const_iterator i = jsonlist->begin(),
-                                             eoi = jsonlist->end();
-             i != eoi; ++i) {
-          Dict* jsondict = downcast<Dict>(*i);
-          if (jsondict) {
-            auto resp = processJsonRpcRequest(jsondict, e);
-            results.push_back(std::move(resp));
-          }
-        }
-        addResponse(wsSession, results);
-      }
-      else {
-        RpcResponse res(
-            createJsonRpcErrorResponse(-32600, "Invalid Request.", Null::g()));
-        addResponse(wsSession, res);
-      }
-    }
+  // wslay handles close, ping and pong frames at the protocol layer. They
+  // carry no JSON-RPC request and must not enqueue an "Invalid Request"
+  // response, especially after close has made the send queue invalid.
+  if (wslay_is_ctrl_frame(arg->opcode)) {
+    return;
+  }
+
+  // TODO Only process text frame
+  ssize_t error = 0;
+  auto json = wsSession->parseFinal(nullptr, 0, error);
+  if (error < 0) {
+    A2_LOG_INFO("Failed to parse JSON-RPC request");
+    RpcResponse res(
+        createJsonRpcErrorResponse(-32700, "Parse error.", Null::g()));
+    addResponse(wsSession, res);
+    return;
+  }
+  Dict* jsondict = downcast<Dict>(json);
+  auto e = wsSession->getDownloadEngine();
+  if (jsondict) {
+    RpcResponse res = processJsonRpcRequest(jsondict, e);
+    addResponse(wsSession, res);
   }
   else {
-    RpcResponse res(
-        createJsonRpcErrorResponse(-32600, "Invalid Request.", Null::g()));
-    addResponse(wsSession, res);
+    List* jsonlist = downcast<List>(json);
+    if (jsonlist) {
+      // This is batch call
+      std::vector<RpcResponse> results;
+      for (List::ValueType::const_iterator i = jsonlist->begin(),
+                                           eoi = jsonlist->end();
+           i != eoi; ++i) {
+        Dict* jsondict = downcast<Dict>(*i);
+        if (jsondict) {
+          auto resp = processJsonRpcRequest(jsondict, e);
+          results.push_back(std::move(resp));
+        }
+      }
+      addResponse(wsSession, results);
+    }
+    else {
+      RpcResponse res(
+          createJsonRpcErrorResponse(-32600, "Invalid Request.", Null::g()));
+      addResponse(wsSession, res);
+    }
   }
 }
 } // namespace
@@ -222,6 +223,10 @@ WebSocketSession::WebSocketSession(const std::shared_ptr<SocketCore>& socket,
       e_(e),
       ignorePayload_(false),
       authorized_(e->validateToken(A2STR::NIL)),
+      queueFailed_(false),
+      firstMessageQueued_(false),
+      firstMessageSent_(false),
+      writeBlockedLogged_(false),
       receivedLength_(0),
       command_(nullptr)
 {
@@ -248,22 +253,34 @@ bool WebSocketSession::finish() { return !wantRead() && !wantWrite(); }
 
 int WebSocketSession::onReadEvent()
 {
-  if (wslay_event_recv(wsctx_) == 0) {
-    return 0;
-  }
-  else {
+  if (queueFailed_) {
     return -1;
   }
+  auto rv = wslay_event_recv(wsctx_);
+  if (rv == 0 && !queueFailed_) {
+    return 0;
+  }
+  if (!queueFailed_) {
+    A2_LOG_WARN(fmt("RPC-DIAG CUID#%" PRId64
+                    " wslay receive failed: code=%d",
+                    command_ ? command_->getCuid() : 0, rv));
+  }
+  return -1;
 }
 
 int WebSocketSession::onWriteEvent()
 {
-  if (wslay_event_send(wsctx_) == 0) {
-    return 0;
-  }
-  else {
+  if (queueFailed_) {
     return -1;
   }
+  auto rv = wslay_event_send(wsctx_);
+  if (rv == 0) {
+    return 0;
+  }
+  A2_LOG_WARN(fmt("RPC-DIAG CUID#%" PRId64
+                  " wslay send failed: code=%d",
+                  command_ ? command_->getCuid() : 0, rv));
+  return -1;
 }
 
 namespace {
@@ -286,7 +303,7 @@ public:
 };
 } // namespace
 
-void WebSocketSession::addTextMessage(const std::string& msg, bool delayed)
+bool WebSocketSession::addTextMessage(const std::string& msg, bool delayed)
 {
   if (delayed) {
     auto e = getDownloadEngine();
@@ -294,7 +311,7 @@ void WebSocketSession::addTextMessage(const std::string& msg, bool delayed)
     auto c = make_unique<TextMessageCommand>(cuid, command_->getSession(), msg);
     e->addCommand(
         make_unique<DelayedCommand>(cuid, e, 1_s, std::move(c), false));
-    return;
+    return true;
   }
 
   // TODO Don't add text message if the size of outbound queue in
@@ -302,7 +319,56 @@ void WebSocketSession::addTextMessage(const std::string& msg, bool delayed)
   wslay_event_msg arg = {WSLAY_TEXT_FRAME,
                          reinterpret_cast<const uint8_t*>(msg.c_str()),
                          msg.size()};
-  wslay_event_queue_msg(wsctx_, &arg);
+  auto rv = wslay_event_queue_msg(wsctx_, &arg);
+  if (rv != 0) {
+    queueFailed_ = true;
+    A2_LOG_WARN(fmt("RPC-DIAG CUID#%" PRId64
+                    " WebSocket response queue failed: code=%d bytes=%zu",
+                    command_ ? command_->getCuid() : 0, rv, msg.size()));
+    if (command_) {
+      command_->messageQueued();
+    }
+    return false;
+  }
+
+  if (!firstMessageQueued_) {
+    firstMessageQueued_ = true;
+    A2_LOG_NOTICE(fmt("RPC-DIAG CUID#%" PRId64
+                      " first WebSocket response queued: bytes=%zu",
+                      command_ ? command_->getCuid() : 0, msg.size()));
+  }
+  if (command_) {
+    command_->messageQueued();
+  }
+  return true;
+}
+
+void WebSocketSession::recordWriteResult(size_t attempted, ssize_t sent)
+{
+  if (sent > 0 && !firstMessageSent_) {
+    firstMessageSent_ = true;
+    A2_LOG_NOTICE(fmt("RPC-DIAG CUID#%" PRId64
+                      " first WebSocket response bytes sent: attempted=%zu "
+                      "sent=%" PRId64,
+                      command_ ? command_->getCuid() : 0, attempted,
+                      static_cast<int64_t>(sent)));
+    return;
+  }
+
+  if (sent == 0 && !writeBlockedLogged_) {
+    writeBlockedLogged_ = true;
+    if (socket_->wantRead() || socket_->wantWrite()) {
+      A2_LOG_WARN(fmt("RPC-DIAG CUID#%" PRId64
+                      " WebSocket send would block: attempted=%zu",
+                      command_ ? command_->getCuid() : 0, attempted));
+    }
+    else {
+      A2_LOG_WARN(fmt("RPC-DIAG CUID#%" PRId64
+                      " WebSocket send returned zero without retry "
+                      "direction: attempted=%zu",
+                      command_ ? command_->getCuid() : 0, attempted));
+    }
+  }
 }
 
 bool WebSocketSession::closeReceived()

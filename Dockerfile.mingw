@@ -97,9 +97,13 @@ RUN . /deps.env && tar xf zlib-$ZLIB_VERSION.tar.gz && \
 
 # Keep the provider modules built into the static libraries: aria2 loads the
 # legacy provider for BitTorrent MSE, and a standalone aria2c.exe cannot dlopen
-# a legacy provider DLL. OpenSSL 3.2+ also builds in its Windows store loader;
-# aria2 explicitly attaches that loader to the native ROOT store, so the
-# packaged application does not need SSL_CERT_FILE or a bundled CA file.
+# a legacy provider DLL. Do not build the unused command-line applications or
+# let the portable aria2c.exe auto-load a machine-wide openssl.cnf. The latter
+# can otherwise change provider activation and default EVP properties before
+# aria2 initializes its statically linked providers. OpenSSL 3.2+ also builds
+# in its Windows store loader; aria2 explicitly attaches that loader to the
+# native ROOT store, so the packaged application does not need SSL_CERT_FILE or
+# a bundled CA file.
 RUN . /deps.env && tar xf openssl-$OPENSSL_VERSION.tar.gz && \
     cd openssl-$OPENSSL_VERSION && \
     case "$HOST" in \
@@ -111,6 +115,8 @@ RUN . /deps.env && tar xf openssl-$OPENSSL_VERSION.tar.gz && \
         no-shared \
         no-module \
         no-tests \
+        no-apps \
+        no-autoload-config \
         --cross-compile-prefix=$HOST- \
         --prefix=/usr/local/$HOST \
         --libdir=lib \
@@ -157,6 +163,9 @@ ARG TLS_BACKEND=openssl
 RUN TLS_BACKEND="$TLS_BACKEND" ./mingw-config && \
     case "$TLS_BACKEND" in \
       openssl) grep -q '^#define HAVE_OPENSSL 1' config.h && \
+               grep -q '^# *define OPENSSL_NO_AUTOLOAD_CONFIG' \
+                 /usr/local/$HOST/include/openssl/configuration.h && \
+               test ! -e /usr/local/$HOST/bin/openssl.exe && \
                ! grep -q '^#define HAVE_WINTLS 1' config.h ;; \
       wintls)  grep -q '^#define HAVE_WINTLS 1' config.h && \
                ! grep -q '^#define HAVE_OPENSSL 1' config.h ;; \

@@ -84,6 +84,12 @@ void WebSocketInteractionCommand::updateWriteCheck()
   }
 }
 
+void WebSocketInteractionCommand::messageQueued()
+{
+  setStatusActive();
+  e_->setNoWait(true);
+}
+
 bool WebSocketInteractionCommand::execute()
 {
   if (e_->isHaltRequested()) {
