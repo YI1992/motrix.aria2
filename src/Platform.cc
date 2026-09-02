@@ -120,8 +120,8 @@ bool Platform::setUp()
 
 #ifdef HAVE_OPENSSL
 #  if OPENSSL_VERSION_NUMBER >= 0x30000000L
-#    if defined(_WIN32) && defined(ARIA2_MOTRIX_HERMETIC_OPENSSL)
-  // The Windows release links OpenSSL and its providers statically.  Loading
+#    if defined(ARIA2_MOTRIX_HERMETIC_OPENSSL)
+  // Motrix release binaries link OpenSSL and its providers statically. Loading
   // a machine-wide OPENSSL_CONF (or one inherited from an unrelated OpenSSL
   // installation) can nevertheless replace the default EVP properties and
   // make aria2's SHA-1 users fail.  Those users include the WebSocket accept
@@ -131,7 +131,7 @@ bool Platform::setUp()
   if (OPENSSL_init_crypto(OPENSSL_INIT_NO_LOAD_CONFIG, nullptr) != 1) {
     throw DL_ABORT_EX("OpenSSL initialization without external config failed.");
   }
-#    endif // _WIN32 && ARIA2_MOTRIX_HERMETIC_OPENSSL
+#    endif // ARIA2_MOTRIX_HERMETIC_OPENSSL
 
   // RC4 is in the legacy provider.
   legacy_provider_ = OSSL_PROVIDER_load(nullptr, "legacy");

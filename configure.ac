@@ -410,6 +410,10 @@ if test "x$with_openssl" = "xyes" && test "x$have_ssl" != "xyes"; then
   if test "x$have_openssl" = "xyes"; then
     have_ssl=yes
     AC_DEFINE([HAVE_OPENSSL], [1], [Define to 1 if you have openssl.])
+    if test "x$have_osx" = "xyes"; then
+      OPENSSL_PLATFORM_LIBS="-framework CoreFoundation -framework Security"
+    fi
+    AC_SUBST([OPENSSL_PLATFORM_LIBS])
 
     save_LIBS=$LIBS
     LIBS="$OPENSSL_LIBS $LIBS"

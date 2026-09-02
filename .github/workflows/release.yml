@@ -7,7 +7,7 @@ on:
     inputs:
       version:
         description: 'Version for a dry run (no leading v)'
-        default: '1.37.0-motrix.11-dev'
+        default: '1.37.0-motrix.12-dev'
 
 permissions:
   contents: write
@@ -67,6 +67,64 @@ jobs:
       with:
         name: darwin-${{ matrix.asset_arch }}
         path: aria2c-*-darwin-*.tar.gz
+
+  macos-smoke:
+    needs: macos
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - { asset_arch: arm64, runner: macos-26 }
+        - { asset_arch: x64,   runner: macos-26-intel }
+    runs-on: ${{ matrix.runner }}
+    steps:
+    - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+    - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      with:
+        name: darwin-${{ matrix.asset_arch }}
+        path: dist
+    - name: Verify static OpenSSL, TLS 1.3 and certificate trust
+      run: |
+        set -euo pipefail
+        archive=$(find dist -type f -name '*.tar.gz' -print -quit)
+        test -n "$archive"
+        mkdir bin
+        tar -xzf "$archive" -C bin
+
+        expected_openssl=$(sed -n 's/^OPENSSL_VERSION=//p' scripts/ci/deps.env)
+        version_output=$(bin/aria2c --version)
+        printf '%s\n' "$version_output"
+        grep -qF "OpenSSL/$expected_openssl" <<< "$version_output"
+        if grep -qF 'AppleTLS' <<< "$version_output"; then
+          echo 'ERROR: AppleTLS is still present in the macOS release'
+          exit 1
+        fi
+
+        otool -L bin/aria2c
+        if otool -L bin/aria2c | tail -n +2 | grep -Eiq 'lib(ssl|crypto)[^/]*\.dylib'; then
+          echo 'ERROR: OpenSSL must be statically linked'
+          exit 1
+        fi
+
+        # The release must neither load a machine-wide OpenSSL configuration
+        # nor require an external CA bundle/provider directory.
+        export SSL_CERT_FILE="$RUNNER_TEMP/missing-ca.pem"
+        export SSL_CERT_DIR="$RUNNER_TEMP/missing-certs"
+        export OPENSSL_CONF="$RUNNER_TEMP/missing-openssl.cnf"
+        export OPENSSL_MODULES="$RUNNER_TEMP/missing-modules"
+        tls13_output=$(bin/aria2c \
+          --no-conf=true --dry-run=true --check-certificate=true \
+          --max-tries=2 --connect-timeout=30 --timeout=30 \
+          --console-log-level=debug --summary-interval=0 \
+          https://tls13.1d.pw 2>&1)
+        printf '%s\n' "$tls13_output"
+        grep -q 'with TLSv1.3' <<< "$tls13_output"
+
+        bin/aria2c \
+          --no-conf=true --dry-run=true --check-certificate=true \
+          --max-tries=2 --connect-timeout=30 --timeout=30 \
+          --console-log-level=notice --summary-interval=0 \
+          https://www.cloudflare.com/favicon.ico
 
   windows:
     needs: version
@@ -282,7 +340,7 @@ jobs:
         path: aria2c-*-android-arm.tar.gz
 
   publish:
-    needs: [macos, windows-smoke, motrix-windows-consumer, linux, android]
+    needs: [macos-smoke, windows-smoke, motrix-windows-consumer, linux, android]
     if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     steps:
@@ -298,6 +356,8 @@ jobs:
           'aria2 fork build for Motrix. Base: upstream 1.37.0.' \
           '' \
           'Highlights:' \
+          '- Replace the legacy macOS AppleTLS backend with statically linked OpenSSL 3.5.8 LTS.' \
+          '- Restore TLS 1.3-only downloads, use macOS Keychain trust roots, and gate both architectures with TLS/certificate smoke tests.' \
           '- Fix persistent WebSocket JSON-RPC responses on affected Windows systems (#2027, #2029).' \
           '- Isolate the static Windows OpenSSL runtime from machine-wide OpenSSL configuration.' \
           '- Upgrade OpenSSL to 3.5.8 LTS and libgcrypt to 1.12.3.' \

@@ -95,7 +95,7 @@ jobs:
       if: runner.os == 'macOS'
       run: |
         ./configure \
-          --without-openssl --without-gnutls --with-appletls \
+          --with-openssl --without-gnutls --without-appletls \
           --disable-nls
     - name: Build aria2
       run: |

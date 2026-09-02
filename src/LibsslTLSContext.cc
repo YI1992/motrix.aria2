@@ -41,6 +41,12 @@
 #include <openssl/pkcs12.h>
 #include <openssl/bio.h>
 #include <openssl/x509_vfy.h>
+#include <openssl/x509err.h>
+
+#if defined(__APPLE__)
+#  include <CoreFoundation/CoreFoundation.h>
+#  include <Security/Security.h>
+#endif // __APPLE__
 
 #include "LogFactory.h"
 #include "Logger.h"
@@ -286,6 +292,66 @@ bool OpenSSLTLSContext::addSystemTrustedCACerts()
     A2_LOG_INFO(fmt(MSG_LOADING_SYSTEM_TRUSTED_CA_CERTS_FAILED,
                     ERR_error_string(ERR_get_error(), nullptr)));
     return false;
+  }
+#elif defined(__APPLE__)
+  // A standalone OpenSSL build cannot read the macOS Keychain by itself.
+  // Keep its default file paths as a fallback, then import Apple's current
+  // system trust anchors into the OpenSSL store used by this TLS context.
+  auto certStore = SSL_CTX_get_cert_store(sslCtx_);
+  auto loadedDefaultPaths = SSL_CTX_set_default_verify_paths(sslCtx_) == 1;
+  if (!loadedDefaultPaths) {
+    ERR_clear_error();
+  }
+
+  CFArrayRef anchors = nullptr;
+  auto status = SecTrustCopyAnchorCertificates(&anchors);
+  if (status != errSecSuccess || anchors == nullptr || certStore == nullptr) {
+    if (anchors != nullptr) {
+      CFRelease(anchors);
+    }
+    if (!loadedDefaultPaths) {
+      A2_LOG_INFO("Failed to load the macOS system trust anchors.");
+      return false;
+    }
+  }
+  else {
+    size_t loadedAnchors = 0;
+    auto count = CFArrayGetCount(anchors);
+    for (CFIndex i = 0; i < count; ++i) {
+      auto secCert = reinterpret_cast<SecCertificateRef>(
+          const_cast<void*>(CFArrayGetValueAtIndex(anchors, i)));
+      auto certData = SecCertificateCopyData(secCert);
+      if (certData == nullptr) {
+        continue;
+      }
+
+      auto bytes = CFDataGetBytePtr(certData);
+      auto cert = d2i_X509(nullptr, &bytes, CFDataGetLength(certData));
+      CFRelease(certData);
+      if (cert == nullptr) {
+        ERR_clear_error();
+        continue;
+      }
+
+      if (X509_STORE_add_cert(certStore, cert) == 1) {
+        ++loadedAnchors;
+      }
+      else {
+        auto error = ERR_peek_last_error();
+        if (ERR_GET_LIB(error) == ERR_LIB_X509 &&
+            ERR_GET_REASON(error) == X509_R_CERT_ALREADY_IN_HASH_TABLE) {
+          ++loadedAnchors;
+        }
+        ERR_clear_error();
+      }
+      X509_free(cert);
+    }
+    CFRelease(anchors);
+
+    if (loadedAnchors == 0 && !loadedDefaultPaths) {
+      A2_LOG_INFO("No macOS system trust anchors could be loaded.");
+      return false;
+    }
   }
 #else  // !Windows or OpenSSL < 3.2
   if (SSL_CTX_set_default_verify_paths(sslCtx_) != 1) {

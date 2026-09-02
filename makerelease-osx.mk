@@ -7,7 +7,7 @@
 #  - Build static libraries of aria2 dependencies.
 #  - Create a statically linked, aria2 release.
 #    - The build will have all major features enabled, and will use
-#      AppleTLS and GMP.
+#      OpenSSL.
 #  - Create a corresponding .tar.bz containing the binaries:
 #  - Create a corresponding .pkg installer.
 #  - Create a corresponding .dmg image containing said installer.
@@ -18,8 +18,9 @@
 #  - zlib (compression, in particular web compression)
 #  - c-ares (asynchronous DNS resolver)
 #  - expat (XML parser, for metalinks)
-#  - gmp (multi-precision arithmetric library, for DHKeyExchange, BitTorrent)
 #  - sqlite3 (self-contained SQL database, for Firefox3 cookie reading)
+#  - OpenSSL (TLS, hashing and BitTorrent encryption)
+#  - libssh2 (SFTP support, using the same OpenSSL build)
 #  - cppunit (unit tests for C++, framework in use by aria2 `make check`)
 #
 #
@@ -140,6 +141,10 @@ gmp_confflags = --disable-cxx --enable-assembly --with-pic --enable-fat
 gmp_cflags=$(CFLAGS)
 gmp_cxxflags=$(CXXFLAGS)
 
+openssl_version = $(OPENSSL_VERSION)
+openssl_hash = $(OPENSSL_SHA256)
+openssl_url = https://github.com/openssl/openssl/releases/download/openssl-$(openssl_version)/openssl-$(openssl_version).tar.gz
+
 libgpgerror_version = $(LIBGPGERROR_VERSION)
 libgpgerror_hash = 7a85413f2bc354f4f8aa832b718af122e48965e9e0eb9012ee659c13c6385c93
 libgpgerror_url = https://gnupg.org/ftp/gcrypt/libgpg-error/libgpg-error-$(libgpgerror_version).tar.bz2
@@ -160,7 +165,7 @@ libssh2_url = https://www.libssh2.org/download/libssh2-$(libssh2_version).tar.gz
 libssh2_cflags=$(CFLAGS) $(LTO_FLAGS)
 libssh2_cxxflags=$(CXXFLAGS) $(LTO_FLAGS)
 libssh2_ldflags=$(CFLAGS) $(LTO_FLAGS)
-libssh2_confflags = --with-pic --with-crypto=libgcrypt --with-libgcrypt-prefix=$(PWD)/arch
+libssh2_confflags = --with-pic --with-crypto=openssl --with-libssl-prefix=$(PWD)/arch
 # Upstream CVE fixes not yet in any tagged libssh2 release (see patches/);
 # drop these when LIBSSH2_VERSION moves past 1.11.1.
 libssh2_patches = \
@@ -180,7 +185,9 @@ cppunit_cxxflags=$(CXXFLAGS) $(LTO_FLAGS)
 
 
 # ARCHLIBS that can be template build
-ARCHLIBS = expat cares sqlite gmp libgpgerror libgcrypt libssh2 cppunit
+ARCHLIBS = expat cares sqlite cppunit
+# OpenSSL has a non-autoconf build; libssh2 must be built after it.
+SPECIAL_ARCHLIBS = openssl libssh2
 # NONARCHLIBS that cannot be template build
 NONARCHLIBS = zlib
 
@@ -200,17 +207,17 @@ ARIA2_CONFFLAGS = \
         --enable-metalink \
         --enable-bittorrent \
         --disable-nls \
-        --with-appletls \
-        --with-libgmp \
+        --without-appletls \
+        --with-openssl \
+        --without-libgmp \
         --with-sqlite3 \
         --with-libz \
         --with-libexpat \
         --with-libcares \
-        --with-libgcrypt \
+        --without-libgcrypt \
         --with-libssh2 \
         --without-libuv \
         --without-gnutls \
-        --without-openssl \
         --without-libnettle \
         --without-libxml2 \
         ARIA2_STATIC=yes
@@ -362,9 +369,34 @@ zlib.%.build: zlib.stamp
 
 $(foreach lib,$(NONARCHLIBS),$(eval $(call NONARCH_template,$(lib))))
 
+.PRECIOUS: openssl.%.build
+openssl.%.build: openssl.stamp
+	$(eval BASE := $(basename $<))
+	$(eval DEST := $(basename $@))
+	$(eval ARCH := $(subst .,,$(suffix $(DEST))))
+	rsync -a $(BASE)/ $(DEST)
+	( cd $(DEST) && \
+		case "$(ARCH)" in \
+			arm64) openssl_target=darwin64-arm64-cc ;; \
+			x86_64) openssl_target=darwin64-x86_64-cc ;; \
+			*) echo "Unsupported macOS architecture: $(ARCH)"; exit 1 ;; \
+		esac && \
+		./Configure "$$openssl_target" \
+			no-shared no-module no-tests no-docs \
+			--prefix=$(PWD)/arch --openssldir=/etc/ssl --libdir=lib \
+			"$(PLATFORMFLAGS) $(OPTFLAGS) -arch $(ARCH)" \
+		)
+	$(MAKE) -C $(DEST) -sj$(CPUS)
+	$(MAKE) -C $(DEST) -s install_sw
+	touch $@
+
+openssl.build: openssl.$(NATIVE_ARCH).build
+
+deps:: openssl.build
+
 define ARCH_template
 .PRECIOUS: $(1).%.build
-$(1).%.build: $(1).stamp
+$(1).%.build: $(1).stamp $(2)
 	$$(eval DEST := $$(basename $$@))
 	$$(eval ARCH := $$(subst .,,$$(suffix $$(DEST))))
 	mkdir -p $$(DEST)
@@ -389,18 +421,20 @@ deps:: $(1).build
 endef
 
 $(foreach lib,$(ARCHLIBS),$(eval $(call ARCH_template,$(lib))))
+$(eval $(call ARCH_template,libssh2,openssl.%.build))
 
 .PRECIOUS: aria2.%.build
-aria2.%.build: zlib.%.build expat.%.build gmp.%.build cares.%.build sqlite.%.build libgpgerror.%.build libgcrypt.%.build libssh2.%.build cppunit.%.build
+aria2.%.build: zlib.%.build expat.%.build openssl.%.build cares.%.build sqlite.%.build libssh2.%.build cppunit.%.build
 	$(eval DEST := $$(basename $$@))
 	$(eval ARCH := $$(subst .,,$$(suffix $$(DEST))))
 	mkdir -p $(DEST)
-	( cd $(DEST) && ../$(SRCDIR)/configure \
+	( cd $(DEST) && $(SRCDIR)/configure \
 		--prefix=$(ARIA2_PREFIX) \
 		--bindir=$(PWD)/$(DEST) \
 		--sysconfdir=/etc \
 		--with-cppunit-prefix=$(PWD)/arch \
 		$(ARIA2_CONFFLAGS) \
+		CPPFLAGS="-DARIA2_MOTRIX_HERMETIC_OPENSSL=1 -I$(PWD)/arch/include" \
 		CFLAGS="$(CFLAGS) $(LTO_FLAGS) -arch $(ARCH) -I$(PWD)/arch/include" \
 		CXXFLAGS="$(CXXFLAGS) $(LTO_FLAGS) -arch $(ARCH) -I$(PWD)/arch/include" \
 		LDFLAGS="$(LDFLAGS) $(CXXFLAGS) $(LTO_FLAGS) -L$(PWD)/arch/lib" \
@@ -482,7 +516,7 @@ clean: clean-dist
 	rm -rf *aria2*
 
 cleaner: clean
-	rm -rf *.build *.check *.stamp $(ARCHLIBS) $(NONARCHLIBS) arch *.x86_64 *.arm64
+	rm -rf *.build *.check *.stamp $(ARCHLIBS) $(SPECIAL_ARCHLIBS) $(NONARCHLIBS) arch *.x86_64 *.arm64
 
 really-clean: cleaner
 	rm -rf *.tar.*

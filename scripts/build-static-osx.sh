@@ -16,9 +16,11 @@ rm -rf "$DEST"; mkdir -p "$DEST"; cd "$DEST"
 ../../configure --prefix="$BR/out" --bindir="$DEST" --sysconfdir=/etc \
   --with-cppunit-prefix="$BR/arch" \
   --enable-static --disable-shared --enable-metalink --enable-bittorrent \
-  --disable-nls --with-appletls --with-libgmp --with-sqlite3 --with-libz \
-  --with-libexpat --with-libcares --with-libgcrypt --with-libssh2 \
-  --without-libuv --without-gnutls --without-openssl --without-libnettle --without-libxml2 \
+  --disable-nls --without-appletls --with-openssl --without-libgmp --with-sqlite3 --with-libz \
+  --with-libexpat --with-libcares --without-libgcrypt --with-libssh2 \
+  --without-libuv --without-gnutls --without-libnettle --without-libxml2 \
+  ARIA2_STATIC=yes \
+  CPPFLAGS="-DARIA2_MOTRIX_HERMETIC_OPENSSL=1 -I$BR/arch/include" \
   CFLAGS="$COMMON" CXXFLAGS="$COMMON" \
   LDFLAGS="-Wl,-dead_strip -mmacosx-version-min=11.0 -Os -flto -ffunction-sections -fdata-sections -L$BR/arch/lib" \
   PKG_CONFIG_PATH="$BR/arch/lib/pkgconfig"
