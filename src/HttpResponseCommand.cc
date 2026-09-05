@@ -78,6 +78,9 @@
 #include "NullProgressInfoFile.h"
 #include "Checksum.h"
 #include "ChecksumCheckIntegrityEntry.h"
+#ifdef HAVE_SQLITE3
+#  include "Sqlite3SessionStore.h"
+#endif // HAVE_SQLITE3
 #ifdef HAVE_ZLIB
 #  include "GZipDecodingStreamFilter.h"
 #endif // HAVE_ZLIB
@@ -159,6 +162,32 @@ bool HttpResponseCommand::executeInternal()
   httpResponse->retrieveCookie();
 
   const auto& httpHeader = httpResponse->getHttpHeader();
+#ifdef HAVE_SQLITE3
+  if (httpHeader->defined(HttpHeader::SET_COOKIE)) {
+    auto* taskGroup = getRequestGroup();
+    const auto& taskCookies = taskGroup->getTaskCookieStorage();
+    if (taskCookies) {
+      if (auto* ss = getDownloadEngine()->getSqlite3SessionStore()) {
+        try {
+          // Persist both additions and deletion cookies immediately. Waiting
+          // for the periodic task save can lose a server-rotated credential
+          // if the process crashes between responses.
+          ss->replaceTaskCookies(GroupId::toHex(taskGroup->getGID()),
+                                 taskCookies);
+        }
+        catch (RecoverableException& ex) {
+          // The current request can continue with its in-memory jar. Keep the
+          // persistence error visible without logging any cookie material,
+          // and retry the current snapshot on the next periodic task save.
+          ss->markTaskCookiesDirty(GroupId::toHex(taskGroup->getGID()));
+          A2_LOG_ERROR_EX(
+              "sqlite3-persistence: task cookie response persist failed",
+              ex);
+        }
+      }
+    }
+  }
+#endif // HAVE_SQLITE3
   // Disable persistent connection if:
   //   Connection: close is received or the remote server is not HTTP/1.1.
   // We don't care whether non-HTTP/1.1 server returns Connection: keep-alive.

@@ -14,13 +14,15 @@ namespace aria2 {
 
 class Sqlite3MigrationsTest : public CppUnit::TestFixture {
   CPPUNIT_TEST_SUITE(Sqlite3MigrationsTest);
-  CPPUNIT_TEST(testMigrateFreshDbToV1);
+  CPPUNIT_TEST(testMigrateFreshDbToV2);
+  CPPUNIT_TEST(testMigrateExistingV1ToV2);
   CPPUNIT_TEST(testReopenIsIdempotent);
   CPPUNIT_TEST(testFutureVersionRejected);
   CPPUNIT_TEST_SUITE_END();
 
 public:
-  void testMigrateFreshDbToV1();
+  void testMigrateFreshDbToV2();
+  void testMigrateExistingV1ToV2();
   void testReopenIsIdempotent();
   void testFutureVersionRejected();
 };
@@ -43,34 +45,62 @@ std::vector<std::string> tableNames(Sqlite3PersistenceStore& store) {
 }
 } // namespace
 
-void Sqlite3MigrationsTest::testMigrateFreshDbToV1() {
-  std::string path = std::string(A2_TEST_OUT_DIR) + "/test_migrate_v1.db";
+void Sqlite3MigrationsTest::testMigrateFreshDbToV2() {
+  std::string path = std::string(A2_TEST_OUT_DIR) + "/test_migrate_v2.db";
   std::remove(path.c_str());
   Sqlite3PersistenceStore store(path);
   store.open();
   auto names = tableNames(store);
   for (auto t : {"task", "task_progress", "download_history",
-                 "download_history_files", "download_history_file_uris", "meta"}) {
+                 "download_history_files", "download_history_file_uris",
+                 "task_cookie_context", "task_cookie", "meta"}) {
     CPPUNIT_ASSERT_MESSAGE(std::string("missing table: ") + t,
                            std::find(names.begin(), names.end(), t) != names.end());
   }
-  CPPUNIT_ASSERT_EQUAL(std::string("1"), store.queryPragma("user_version"));
+  CPPUNIT_ASSERT_EQUAL(std::string("2"), store.queryPragma("user_version"));
+}
+
+void Sqlite3MigrationsTest::testMigrateExistingV1ToV2() {
+  std::string path = std::string(A2_TEST_OUT_DIR) + "/test_migrate_v1_to_v2.db";
+  std::remove(path.c_str());
+  {
+    Sqlite3PersistenceStore store(path);
+    store.open();
+    sqlite3_exec(store.raw(), "DROP TABLE task_cookie", nullptr, nullptr, nullptr);
+    sqlite3_exec(store.raw(), "DROP TABLE task_cookie_context", nullptr, nullptr,
+                 nullptr);
+    sqlite3_exec(store.raw(),
+                 "UPDATE meta SET value='1' WHERE key='schema_version'",
+                 nullptr, nullptr, nullptr);
+    sqlite3_exec(store.raw(), "PRAGMA user_version=1", nullptr, nullptr, nullptr);
+  }
+  {
+    Sqlite3PersistenceStore store(path);
+    store.open();
+    auto names = tableNames(store);
+    CPPUNIT_ASSERT(std::find(names.begin(), names.end(),
+                             "task_cookie_context") != names.end());
+    CPPUNIT_ASSERT(std::find(names.begin(), names.end(), "task_cookie") !=
+                   names.end());
+    CPPUNIT_ASSERT_EQUAL(std::string("2"),
+                         store.queryPragma("user_version"));
+  }
 }
 
 void Sqlite3MigrationsTest::testReopenIsIdempotent() {
   std::string path = std::string(A2_TEST_OUT_DIR) + "/test_migrate_idempotent.db";
   std::remove(path.c_str());
-  // First open: migrate v0 -> v1.
+    // First open: migrate v0 -> current.
   {
     Sqlite3PersistenceStore store(path);
     store.open();
-    CPPUNIT_ASSERT_EQUAL(std::string("1"), store.queryPragma("user_version"));
+    CPPUNIT_ASSERT_EQUAL(std::string("2"), store.queryPragma("user_version"));
   }
-  // Second open: must not throw, must keep user_version=1.
+  // Second open: must not throw and must keep the current schema version.
   {
     Sqlite3PersistenceStore store(path);
     store.open();
-    CPPUNIT_ASSERT_EQUAL(std::string("1"), store.queryPragma("user_version"));
+    CPPUNIT_ASSERT_EQUAL(std::string("2"), store.queryPragma("user_version"));
   }
 }
 

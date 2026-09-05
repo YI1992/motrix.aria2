@@ -49,7 +49,7 @@ void Sqlite3PersistenceStoreTest::testCorruptDbRenamedAndRebuilt()
   std::remove((dbPath + "-wal").c_str());
   std::remove((dbPath + "-shm").c_str());
 
-  // First open: create a valid v1 database.
+  // First open: create a valid current-schema database.
   {
     Sqlite3PersistenceStore store(dbPath);
     store.open();
@@ -71,8 +71,8 @@ void Sqlite3PersistenceStoreTest::testCorruptDbRenamedAndRebuilt()
     Sqlite3PersistenceStore store(dbPath);
     store.open();
 
-    // Fresh DB must have been migrated to v1.
-    CPPUNIT_ASSERT_EQUAL(std::string("1"), store.queryPragma("user_version"));
+    // Fresh DB must have been migrated to the current schema.
+    CPPUNIT_ASSERT_EQUAL(std::string("2"), store.queryPragma("user_version"));
   }
 
   // Verify at least one sibling .corrupt.* file was created.

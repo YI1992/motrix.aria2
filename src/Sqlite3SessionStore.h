@@ -40,6 +40,7 @@
 #ifdef HAVE_SQLITE3
 
 #include <memory>
+#include <set>
 #include <vector>
 
 #include "GroupId.h"
@@ -47,6 +48,7 @@
 namespace aria2 {
 
 class Option;
+class CookieStorage;
 class RequestGroup;
 class Sqlite3PersistenceStore;
 class RequestGroupMan;
@@ -71,7 +73,20 @@ public:
   // Insert a single task row, or UPDATE if its gid already exists.
   // New rows get queue_position = COALESCE(MAX+1, 0).
   // On conflict: preserves created_at and queue_position; refreshes updated_at.
-  void upsertTask(const std::shared_ptr<RequestGroup>& rg);
+  void upsertTask(const std::shared_ptr<RequestGroup>& rg,
+                  bool persistTaskCookieSnapshot = true);
+
+  // Atomically replace the durable task-scoped cookie jar. The context row is
+  // retained for an empty jar so isolation survives an engine restart.
+  void replaceTaskCookies(const std::string& gidHex,
+                          const std::shared_ptr<CookieStorage>& storage);
+
+  // Retry the latest in-memory snapshot during the next periodic task save.
+  void markTaskCookiesDirty(const std::string& gidHex);
+
+  // Remove only the task-scoped cookie context, preserving the task row and
+  // its result/session data.
+  void deleteTaskCookies(const std::string& gidHex);
 
   // Delete the task row identified by gidHex.
   void deleteTask(const std::string& gidHex);
@@ -84,8 +99,10 @@ public:
 
 private:
   Sqlite3PersistenceStore* store_;
+  std::set<std::string> dirtyTaskCookieGids_;
 
   void removeOrphanTasks(const std::vector<a2_gid_t>& liveGids);
+  void restoreTaskCookies(const std::shared_ptr<RequestGroup>& rg);
 };
 
 } // namespace aria2

@@ -53,6 +53,9 @@ static const char* kPragmas[] = {
     "PRAGMA journal_mode = WAL;",
     "PRAGMA synchronous = NORMAL;",
     "PRAGMA foreign_keys = ON;",
+    // Scrub deleted cookie payloads from active database pages while avoiding
+    // the full freelist rewrite cost of secure_delete=ON.
+    "PRAGMA secure_delete = FAST;",
     "PRAGMA busy_timeout = 5000;",
     "PRAGMA temp_store = MEMORY;",
     "PRAGMA cache_size = -8000;",

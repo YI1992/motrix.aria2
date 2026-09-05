@@ -45,12 +45,15 @@
 #include <cppunit/extensions/HelperMacros.h>
 
 #include "DownloadContext.h"
+#include "Cookie.h"
+#include "CookieStorage.h"
 #include "FileEntry.h"
 #include "GroupId.h"
 #include "Option.h"
 #include "RequestGroup.h"
 #include "RequestGroupMan.h"
 #include "Sqlite3PersistenceStore.h"
+#include "TimeA2.h"
 #include "TestUtil.h"
 #include "prefs.h"
 
@@ -62,6 +65,8 @@ class Sqlite3SessionStoreTest : public CppUnit::TestFixture {
   CPPUNIT_TEST(testSaveLoadRoundTrip);
   CPPUNIT_TEST(testQueuePositionMove);
   CPPUNIT_TEST(testUpsertTaskInsertsThenUpdates);
+  CPPUNIT_TEST(testTaskCookiesRoundTripIncludingEmpty);
+  CPPUNIT_TEST(testTaskCookieReplacement);
   CPPUNIT_TEST(testDeleteTaskRemovesRow);
   CPPUNIT_TEST(testUpdateTaskState);
   CPPUNIT_TEST_SUITE_END();
@@ -78,6 +83,8 @@ public:
   void testSaveLoadRoundTrip();
   void testQueuePositionMove();
   void testUpsertTaskInsertsThenUpdates();
+  void testTaskCookiesRoundTripIncludingEmpty();
+  void testTaskCookieReplacement();
   void testDeleteTaskRemovesRow();
   void testUpdateTaskState();
 };
@@ -326,18 +333,197 @@ void Sqlite3SessionStoreTest::testUpsertTaskInsertsThenUpdates()
   }
 }
 
+void Sqlite3SessionStoreTest::testTaskCookiesRoundTripIncludingEmpty()
+{
+  const auto now = Time().getTimeFromEpoch();
+  a2_gid_t cookieGid;
+  a2_gid_t emptyGid;
+  {
+    auto makeCookieRG = [&](const std::string& uri) {
+      auto op = std::make_shared<Option>(*option_);
+      op->put(PREF_REQUIRE_TASK_COOKIES, A2_V_TRUE);
+      auto dctx = std::make_shared<DownloadContext>(0, 0, "");
+      dctx->getFirstFileEntry()->addUri(uri);
+      auto rg = std::make_shared<RequestGroup>(GroupId::create(), op);
+      rg->setDownloadContext(dctx);
+      return rg;
+    };
+
+    auto cookieRG = makeCookieRG("http://127.0.0.1/protected.bin");
+    auto cookieStorage = std::make_shared<CookieStorage>();
+    cookieStorage->store(make_unique<Cookie>(
+                             "sid", "account-a", now + 3600, true,
+                             "127.0.0.1", true, "/", false, true, now),
+                         now);
+    cookieRG->setTaskCookieStorage(cookieStorage);
+    cookieGid = cookieRG->getGID();
+
+    auto emptyRG = makeCookieRG("http://127.0.0.1/public.bin");
+    emptyRG->setTaskCookieStorage(std::make_shared<CookieStorage>());
+    emptyGid = emptyRG->getGID();
+
+    Sqlite3SessionStore session(store_.get());
+    session.upsertTask(cookieRG);
+    session.upsertTask(emptyRG);
+    const auto insertExpired =
+        "INSERT INTO task_cookie"
+        " SELECT gid, 'expired', 'stale', domain, path, host_only, secure,"
+        " http_only, 1, 1, creation_time_unix_s, last_access_time_unix_s"
+        " FROM task_cookie WHERE gid='" +
+        GroupId::toHex(cookieGid) + "' LIMIT 1";
+    CPPUNIT_ASSERT_EQUAL(
+        SQLITE_OK,
+        sqlite3_exec(store_->raw(), insertExpired.c_str(), nullptr, nullptr,
+                     nullptr));
+  }
+
+  std::vector<std::shared_ptr<RequestGroup>> loaded;
+  Sqlite3SessionStore session(store_.get());
+  session.loadActiveTasksInto(loaded, option_);
+  CPPUNIT_ASSERT_EQUAL((size_t)2, loaded.size());
+
+  for (const auto& rg : loaded) {
+    const auto& storage = rg->getTaskCookieStorage();
+    CPPUNIT_ASSERT(storage);
+    if (rg->getGID() == cookieGid) {
+      auto cookies = storage->criteriaFind("127.0.0.1", "/protected.bin",
+                                           now, false);
+      CPPUNIT_ASSERT_EQUAL((size_t)1, cookies.size());
+      CPPUNIT_ASSERT_EQUAL(std::string("sid"), cookies.front()->getName());
+      CPPUNIT_ASSERT_EQUAL(std::string("account-a"),
+                           cookies.front()->getValue());
+      CPPUNIT_ASSERT(cookies.front()->getHttpOnly());
+      sqlite3_stmt* stmt = nullptr;
+      CPPUNIT_ASSERT_EQUAL(
+          SQLITE_OK,
+          sqlite3_prepare_v2(store_->raw(),
+                             "SELECT COUNT(*) FROM task_cookie WHERE gid=?",
+                             -1, &stmt, nullptr));
+      const auto gidHex = GroupId::toHex(cookieGid);
+      sqlite3_bind_text(stmt, 1, gidHex.c_str(), -1, SQLITE_STATIC);
+      CPPUNIT_ASSERT_EQUAL(SQLITE_ROW, sqlite3_step(stmt));
+      CPPUNIT_ASSERT_EQUAL(1, sqlite3_column_int(stmt, 0));
+      sqlite3_finalize(stmt);
+    }
+    else {
+      CPPUNIT_ASSERT_EQUAL(emptyGid, rg->getGID());
+      CPPUNIT_ASSERT_EQUAL((size_t)0, storage->size());
+    }
+  }
+}
+
+void Sqlite3SessionStoreTest::testTaskCookieReplacement()
+{
+  auto op = std::make_shared<Option>(*option_);
+  op->put(PREF_REQUIRE_TASK_COOKIES, A2_V_TRUE);
+  auto dctx = std::make_shared<DownloadContext>(0, 0, "");
+  dctx->getFirstFileEntry()->addUri("http://example.com/file.bin");
+  auto rg = std::make_shared<RequestGroup>(GroupId::create(), op);
+  rg->setDownloadContext(dctx);
+  rg->setTaskCookieStorage(std::make_shared<CookieStorage>());
+
+  Sqlite3SessionStore session(store_.get());
+  session.upsertTask(rg);
+  const auto gidHex = GroupId::toHex(rg->getGID());
+
+  auto replacement = std::make_shared<CookieStorage>();
+  const auto now = Time().getTimeFromEpoch();
+  replacement->store(make_unique<Cookie>(
+                         "sid", "replacement", 0, false, "example.com",
+                         true, "/", false, false, now),
+                     now);
+  session.replaceTaskCookies(gidHex, replacement);
+
+  sqlite3_stmt* stmt = nullptr;
+  CPPUNIT_ASSERT_EQUAL(
+      SQLITE_OK,
+      sqlite3_prepare_v2(store_->raw(),
+                         "SELECT value FROM task_cookie WHERE gid=?", -1,
+                         &stmt, nullptr));
+  sqlite3_bind_text(stmt, 1, gidHex.c_str(), -1, SQLITE_STATIC);
+  CPPUNIT_ASSERT_EQUAL(SQLITE_ROW, sqlite3_step(stmt));
+  const char* value =
+      reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+  CPPUNIT_ASSERT_EQUAL(std::string("replacement"),
+                       std::string(value ? value : ""));
+  sqlite3_finalize(stmt);
+
+  session.replaceTaskCookies(gidHex, std::make_shared<CookieStorage>());
+  CPPUNIT_ASSERT_EQUAL(
+      SQLITE_OK,
+      sqlite3_exec(store_->raw(),
+                   ("UPDATE task_cookie_context SET updated_at=1 WHERE gid='" +
+                    gidHex + "'")
+                       .c_str(),
+                   nullptr, nullptr, nullptr));
+  session.upsertTask(rg, false);
+  stmt = nullptr;
+  CPPUNIT_ASSERT_EQUAL(
+      SQLITE_OK,
+      sqlite3_prepare_v2(
+          store_->raw(),
+          "SELECT (SELECT COUNT(*) FROM task_cookie_context WHERE gid=?),"
+          " (SELECT COUNT(*) FROM task_cookie WHERE gid=?),"
+          " (SELECT updated_at FROM task_cookie_context WHERE gid=?)",
+          -1, &stmt, nullptr));
+  sqlite3_bind_text(stmt, 1, gidHex.c_str(), -1, SQLITE_STATIC);
+  sqlite3_bind_text(stmt, 2, gidHex.c_str(), -1, SQLITE_STATIC);
+  sqlite3_bind_text(stmt, 3, gidHex.c_str(), -1, SQLITE_STATIC);
+  CPPUNIT_ASSERT_EQUAL(SQLITE_ROW, sqlite3_step(stmt));
+  CPPUNIT_ASSERT_EQUAL(1, sqlite3_column_int(stmt, 0));
+  CPPUNIT_ASSERT_EQUAL(0, sqlite3_column_int(stmt, 1));
+  CPPUNIT_ASSERT_EQUAL(1, sqlite3_column_int(stmt, 2));
+  sqlite3_finalize(stmt);
+
+  rg->setTaskCookieStorage(replacement);
+  session.markTaskCookiesDirty(gidHex);
+  session.upsertTask(rg, false);
+  stmt = nullptr;
+  CPPUNIT_ASSERT_EQUAL(
+      SQLITE_OK,
+      sqlite3_prepare_v2(store_->raw(),
+                         "SELECT value FROM task_cookie WHERE gid=?", -1,
+                         &stmt, nullptr));
+  sqlite3_bind_text(stmt, 1, gidHex.c_str(), -1, SQLITE_STATIC);
+  CPPUNIT_ASSERT_EQUAL(SQLITE_ROW, sqlite3_step(stmt));
+  value = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+  CPPUNIT_ASSERT_EQUAL(std::string("replacement"),
+                       std::string(value ? value : ""));
+  sqlite3_finalize(stmt);
+
+  session.deleteTaskCookies(gidHex);
+  stmt = nullptr;
+  CPPUNIT_ASSERT_EQUAL(
+      SQLITE_OK,
+      sqlite3_prepare_v2(store_->raw(),
+                         "SELECT COUNT(*) FROM task_cookie_context", -1,
+                         &stmt, nullptr));
+  CPPUNIT_ASSERT_EQUAL(SQLITE_ROW, sqlite3_step(stmt));
+  CPPUNIT_ASSERT_EQUAL(0, sqlite3_column_int(stmt, 0));
+  sqlite3_finalize(stmt);
+}
+
 void Sqlite3SessionStoreTest::testDeleteTaskRemovesRow()
 {
   sqlite3* db = store_->raw();
   insertTestRow(db, "abc", 0);
 
   Sqlite3SessionStore session(store_.get());
+  session.replaceTaskCookies("abc", std::make_shared<CookieStorage>());
   session.deleteTask("abc");
 
   sqlite3_stmt* stmt = nullptr;
   CPPUNIT_ASSERT_EQUAL(
       SQLITE_OK,
       sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM task", -1, &stmt, nullptr));
+  CPPUNIT_ASSERT_EQUAL(SQLITE_ROW, sqlite3_step(stmt));
+  CPPUNIT_ASSERT_EQUAL(0, sqlite3_column_int(stmt, 0));
+  sqlite3_finalize(stmt);
+
+  CPPUNIT_ASSERT_EQUAL(
+      SQLITE_OK,
+      sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM task_cookie_context", -1,
+                         &stmt, nullptr));
   CPPUNIT_ASSERT_EQUAL(SQLITE_ROW, sqlite3_step(stmt));
   CPPUNIT_ASSERT_EQUAL(0, sqlite3_column_int(stmt, 0));
   sqlite3_finalize(stmt);

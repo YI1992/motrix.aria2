@@ -42,23 +42,36 @@ Cookie 字段：
 语法。数组最多 300 条，每条名称和值合计最多 4096 字节，域名最多 254 字节，路径最多
 4096 字节。沿用原生存储每个域名最多保留 50 条 cookie 的限制。
 
-每个任务都有独立的内存存储。空数组也会创建独立的空存储，不继承启动时的
+每个任务都有独立存储。空数组也会创建独立的空存储，不继承启动时的
 `--load-cookies` 或其他任务的 cookie。响应中的 cookie 只更新当前任务的存储。
 同一逻辑任务的连接、重试、暂停恢复及衍生任务共享该上下文。每次发出请求时，都会检查
 域名、路径、过期时间和 Secure，包括重定向及 Range 请求。创建选项中传入或从全局选项
 继承的固定 `Cookie` 请求头会被移除，以结构化存储为准。
 
-## 重启与重新授权
+## 持久化与重启
 
-结构化 cookie 的值不会写入文本会话、SQLite 持久化或 `--save-cookies` 文件。
-会话只保存 `require-task-cookies=true` 标记。引擎重启后，任务缺少内存上下文时会在
-发出网络请求之前失败，返回说明需要重新提供 cookie 的认证错误。客户端应请求重新授权。
+从 `v1.37.0-motrix.14` 开始，启用 SQLite 持久化时，aria2 会把每个任务的 Cookie
+上下文存入专用的 `task_cookie_context` 和 `task_cookie` 表。任务行与 Cookie 快照在
+同一事务中更新；显式空 jar 也有 context 行。响应中的 `Set-Cookie` 会立即落盘，包括
+删除 Cookie 的响应，进程崩溃后通常不会退回到之前提交的旧值。短暂写入失败会标记该
+任务，并在下次定时保存时重试；未变化的 jar 不会随每次定时保存重复重写。恢复时会先
+删除已经过期的持久 Cookie 行。
 
-以暂停状态恢复任务，再调用 `aria2.setTaskCookies(gid, cookies)`，最后调用
-`aria2.unpause(gid)`。`setTaskCookies` 返回 `OK`，原子替换整个存储，也接受空数组。
-只允许对带有上述标记的等待中或已暂停任务调用；活动任务、已停止任务和普通旧任务会被
-拒绝。刷新活动任务前，先暂停并等待 `status=paused`。如果恢复的任务已经失败，需要
-使用新 cookie 创建任务。客户端不应为了自动恢复而持久化原始 cookie 值。
+Cookie value 以明文存放在本机 SQLite 数据库中，也可能短暂出现在 WAL。数据库及其父
+目录应与其他 Motrix 应用数据一样使用仅当前用户可访问的权限。SQLite 删除使用
+`secure_delete=FAST`。Cookie value 不会复制到文本 session、下载历史、引擎日志或
+`--save-cookies` 输出。
+
+启动时，aria2 在调度任务前恢复该任务的独立 jar。暂停、重试和引擎退出会保留；正常
+完成、终止错误、取消和显式删除结果会清理 Cookie 上下文；删除 task 行也会通过外键
+级联清理两个 Cookie 表。
+
+未启用 SQLite，或数据库丢失、损坏后带标记的任务没有 Cookie 上下文时，任务仍会在
+发出网络请求之前失败。此时以暂停状态恢复任务，调用
+`aria2.setTaskCookies(gid, cookies)`，再调用 `aria2.unpause(gid)`。
+`setTaskCookies` 会原子替换整个 jar，也接受空数组；启用 SQLite 时会同时持久化。它只
+允许用于带标记的等待中或已暂停任务；活动任务、已停止任务和普通旧任务会被拒绝。刷新
+活动任务前，先暂停并等待 `status=paused`。
 
 ## 旧接口与重定向
 
@@ -77,5 +90,6 @@ ARIA2_E2E_BIN="$PWD/src/aria2c" node --test test/e2e/task-cookies.e2e.test.mjs
 ```
 
 测试覆盖任务隔离、重定向作用域、过期时间、HTTPS 降级、固定请求头、非法输入、Range
-暂停恢复及重启后重新授权。发布流程会对打包后的六种 macOS、Windows 和 Linux
-x64/arm64 二进制执行同一套测试，其中 Windows 包含 ia32。
+暂停恢复、SQLite 迁移、重启恢复、服务端 Cookie 轮换及终态清理。发布流程会对打包后
+的六种 macOS、Windows 和 Linux x64/arm64 二进制执行同一套测试，其中 Windows 包含
+ia32。
