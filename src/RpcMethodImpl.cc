@@ -273,6 +273,15 @@ std::unique_ptr<ValueBase> SetTaskCookiesRpcMethod::process(
     throw DL_ABORT_EX(
         "Task cookies can only be set on waiting or paused cookie tasks.");
   }
+#ifdef HAVE_SQLITE3
+  if (auto* ss = e->getSqlite3SessionStore()) {
+    // Persist first. If the durable replacement fails, leave the in-memory
+    // jar unchanged and report the RPC failure instead of claiming that the
+    // new credentials will survive restart.
+    ss->upsertTask(group, false);
+    ss->replaceTaskCookies(GroupId::toHex(gid), cookies);
+  }
+#endif // HAVE_SQLITE3
   group->setTaskCookieStorage(std::move(cookies));
   return createOKResponse();
 }

@@ -286,7 +286,7 @@ void RequestGroup::createInitialCommand(
 {
   if (option_->getAsBool(PREF_REQUIRE_TASK_COOKIES) && !taskCookieStorage_) {
     throw DOWNLOAD_FAILURE_EXCEPTION2(
-        "Task cookies must be supplied again after engine restart.",
+        "Task cookie context is unavailable after engine restart.",
         error_code::HTTP_AUTH_FAILED);
   }
   // Start session timer here.  When file size becomes known, it will

@@ -258,6 +258,61 @@ void migrate_v0_to_v1(Sqlite3PersistenceStore& store)
   });
 }
 
+void migrate_v1_to_v2(Sqlite3PersistenceStore& store)
+{
+  static const char* const sqls[] = {
+      // The context row deliberately exists even when the cookie list is
+      // empty. An empty task-scoped jar is materially different from a
+      // missing jar: the former must remain isolated after restart, while the
+      // latter must keep failing closed.
+      "CREATE TABLE task_cookie_context ("
+      "  gid        TEXT    PRIMARY KEY,"
+      "  updated_at INTEGER NOT NULL,"
+      "  FOREIGN KEY (gid) REFERENCES task(gid) ON DELETE CASCADE"
+      ");",
+
+      "CREATE TABLE task_cookie ("
+      "  gid                     TEXT    NOT NULL,"
+      "  name                    TEXT    NOT NULL,"
+      "  value                   TEXT    NOT NULL,"
+      "  domain                  TEXT    NOT NULL,"
+      "  path                    TEXT    NOT NULL,"
+      "  host_only               INTEGER NOT NULL,"
+      "  secure                  INTEGER NOT NULL,"
+      "  http_only               INTEGER NOT NULL,"
+      "  persistent              INTEGER NOT NULL,"
+      "  expires_at_unix_s       INTEGER NOT NULL,"
+      "  creation_time_unix_s    INTEGER NOT NULL,"
+      "  last_access_time_unix_s INTEGER NOT NULL,"
+      "  PRIMARY KEY (gid, name, domain, path),"
+      "  FOREIGN KEY (gid) REFERENCES task_cookie_context(gid)"
+      "    ON DELETE CASCADE"
+      ");",
+
+      "CREATE INDEX idx_task_cookie_expiry"
+      " ON task_cookie(gid, persistent, expires_at_unix_s);",
+
+      "UPDATE meta SET value = '2' WHERE key = 'schema_version';",
+      "PRAGMA user_version = 2;",
+  };
+
+  store.withTransaction([&]() {
+    for (const char* sql : sqls) {
+      char* errmsg = nullptr;
+      int rc = sqlite3_exec(store.raw(), sql, nullptr, nullptr, &errmsg);
+      if (rc != SQLITE_OK) {
+        std::string errstr;
+        if (errmsg) {
+          errstr = errmsg;
+          sqlite3_free(errmsg);
+        }
+        throw DL_ABORT_EX(fmt(
+            "sqlite3-persistence: migration step failed: %s", errstr.c_str()));
+      }
+    }
+  });
+}
+
 struct Migration {
   int from;
   int to;
@@ -266,7 +321,7 @@ struct Migration {
 
 static const Migration kMigrations[] = {
     {0, 1, &migrate_v0_to_v1},
-    // future: {1, 2, &migrate_v1_to_v2},
+    {1, 2, &migrate_v1_to_v2},
 };
 
 } // namespace

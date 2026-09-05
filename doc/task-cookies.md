@@ -47,31 +47,46 @@ semicolons; names must be HTTP tokens. An array may contain at most 300 records,
 each name plus value at most 4096 bytes, domain at most 254 bytes, and path at
 most 4096 bytes. The existing cookie store retains at most 50 cookies per domain.
 
-Each task receives an independent in-memory store. An empty array explicitly
-creates an empty, isolated store. Neither startup `--load-cookies` nor cookies
-received by another task are inherited. Task responses update only this store.
+Each task receives an independent store. An empty array explicitly creates an
+empty, isolated store. Neither startup `--load-cookies` nor cookies received by
+another task are inherited. Task responses update only this store.
 All connections, retries, pause/resume cycles and generated descendants of the
 logical task use that context. Cookie domain, path, expiry and Secure rules are
 evaluated for each outgoing request, including redirects and Range requests.
 Raw `Cookie` headers supplied in creation options or inherited from global
 options are removed; the structured store is authoritative.
 
-## Restart and reauthorization
+## Persistence and restart
 
-Structured cookie values are not written to text sessions, SQLite persistence
-or `--save-cookies`. Sessions retain `require-task-cookies=true` instead. After
-an engine restart, a task without its in-memory context fails before making a
-network request, with an authentication error explaining that cookies must be
-supplied again. Treat this as a request for fresh authorization.
+Starting with `v1.37.0-motrix.14`, when SQLite persistence is enabled, aria2
+stores each task's cookie context in dedicated `task_cookie_context` and
+`task_cookie` tables. The task row and its cookie snapshot are updated in one
+transaction. A context row also represents an explicitly empty jar. Cookies
+received in `Set-Cookie` responses are flushed immediately, including deletions,
+so a crash cannot normally roll the task back to a previously submitted value.
+A transient write failure marks the task for retry during the next periodic
+save. Unchanged jars are not rewritten on every periodic save. Expired
+persistent-cookie rows are pruned before restoration.
 
-Restore with tasks paused, then call
-`aria2.setTaskCookies(gid, cookies)` followed by `aria2.unpause(gid)`.
-`setTaskCookies` returns `OK` and replaces the whole store atomically, including
-when the array is empty. It is allowed only for waiting or paused tasks carrying
-the requirement marker. Active, stopped and ordinary legacy tasks are rejected.
-Pause an active task and wait for `status=paused` before refreshing its context.
-If a restored task already failed, create a new task with fresh cookies.
-Clients must not persist raw cookie values just to automate this process.
+Cookie values are stored as plaintext in the local SQLite database and may also
+temporarily exist in its WAL. Protect the database and its parent directory with
+the same user-only permissions as other Motrix application data. Deleted SQLite
+records use `secure_delete=FAST`. Values are never copied into text sessions,
+download history, engine logs or `--save-cookies` output.
+
+On startup, aria2 restores the scoped jar before scheduling the task. Pause,
+retry and shutdown retain it. Normal completion, terminal failure, cancellation
+and explicit result removal delete the cookie context; deleting the task row
+also cascades to both cookie tables.
+
+If SQLite persistence is disabled, or a marked task has no cookie context after
+database loss/corruption, it fails before making a network request. Restore it
+paused, call `aria2.setTaskCookies(gid, cookies)`, then call
+`aria2.unpause(gid)`. `setTaskCookies` replaces the complete jar atomically,
+including an empty jar, and durably updates SQLite when enabled. It is allowed
+only for waiting or paused tasks carrying the requirement marker. Active,
+stopped and ordinary legacy tasks are rejected. Pause an active task and wait
+for `status=paused` before refreshing its context.
 
 ## Legacy requests and redirects
 
@@ -93,6 +108,7 @@ ARIA2_E2E_BIN="$PWD/src/aria2c" node --test test/e2e/task-cookies.e2e.test.mjs
 ```
 
 The contract covers task isolation, scoped redirects, expiry, HTTPS downgrade,
-raw headers, malformed input, Range pause/resume and restart reauthorization.
+raw headers, malformed input, Range pause/resume, SQLite migration, restart
+recovery, server cookie rotation and terminal cleanup.
 Release publication runs the same contract against the six packaged macOS,
 Windows and Linux x64/arm64 binaries (Windows includes ia32).

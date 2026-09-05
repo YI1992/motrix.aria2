@@ -37,10 +37,14 @@
 #ifdef HAVE_SQLITE3
 
 #include <chrono>
+#include <iterator>
 #include <sstream>
+#include <vector>
 
 #include <sqlite3.h>
 
+#include "Cookie.h"
+#include "CookieStorage.h"
 #include "DlAbortEx.h"
 #include "GroupId.h"
 #include "MessageDigest.h"
@@ -119,6 +123,150 @@ const char* const kShiftBackwardSql =
 const char* const kPlaceTaskPositionSql =
     "UPDATE task SET queue_position = ? WHERE gid = ?";
 
+const char* const kUpsertTaskCookieContextSql =
+    "INSERT INTO task_cookie_context (gid, updated_at) VALUES (?, ?)"
+    " ON CONFLICT(gid) DO UPDATE SET updated_at = excluded.updated_at";
+
+const char* const kDeleteTaskCookiesSql =
+    "DELETE FROM task_cookie_context WHERE gid = ?";
+
+const char* const kInsertTaskCookieSql =
+    "INSERT INTO task_cookie"
+    " (gid, name, value, domain, path, host_only, secure, http_only,"
+    "  persistent, expires_at_unix_s, creation_time_unix_s,"
+    "  last_access_time_unix_s)"
+    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+
+const char* const kSelectTaskCookieContextSql =
+    "SELECT 1 FROM task_cookie_context WHERE gid = ?";
+
+const char* const kSelectTaskCookiesSql =
+    "SELECT name, value, domain, path, host_only, secure, http_only,"
+    " persistent, expires_at_unix_s, creation_time_unix_s,"
+    " last_access_time_unix_s"
+    " FROM task_cookie WHERE gid = ?";
+
+const char* const kDeleteExpiredTaskCookiesSql =
+    "DELETE FROM task_cookie"
+    " WHERE gid = ? AND persistent = 1 AND expires_at_unix_s < ?";
+
+void bindText(sqlite3_stmt* stmt, int index, const std::string& value)
+{
+  sqlite3_bind_text(stmt, index, value.data(), static_cast<int>(value.size()),
+                    SQLITE_TRANSIENT);
+}
+
+void replaceTaskCookiesInTransaction(
+    sqlite3* db, const std::string& gidHex,
+    const std::shared_ptr<CookieStorage>& storage, int64_t nowMs)
+{
+  if (!storage) {
+    throw DL_ABORT_EX("sqlite3-persistence: missing task cookie storage");
+  }
+
+  {
+    StmtGuard stmt;
+    if (sqlite3_prepare_v2(db, kUpsertTaskCookieContextSql, -1, &stmt.stmt,
+                           nullptr) != SQLITE_OK) {
+      throw DL_ABORT_EX(fmt(
+          "sqlite3-persistence: prepare UPSERT task cookie context failed: %s",
+          sqlite3_errmsg(db)));
+    }
+    bindText(stmt, 1, gidHex);
+    sqlite3_bind_int64(stmt, 2, static_cast<sqlite3_int64>(nowMs));
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+      throw DL_ABORT_EX(fmt(
+          "sqlite3-persistence: UPSERT task cookie context failed: %s",
+          sqlite3_errmsg(db)));
+    }
+  }
+
+  {
+    StmtGuard stmt;
+    if (sqlite3_prepare_v2(db, "DELETE FROM task_cookie WHERE gid = ?", -1,
+                           &stmt.stmt, nullptr) != SQLITE_OK) {
+      throw DL_ABORT_EX(fmt(
+          "sqlite3-persistence: prepare DELETE task cookies failed: %s",
+          sqlite3_errmsg(db)));
+    }
+    bindText(stmt, 1, gidHex);
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+      throw DL_ABORT_EX(fmt(
+          "sqlite3-persistence: DELETE task cookies failed: %s",
+          sqlite3_errmsg(db)));
+    }
+  }
+
+  std::vector<const Cookie*> cookies;
+  storage->dumpCookie(std::back_inserter(cookies));
+  if (cookies.empty()) {
+    return;
+  }
+
+  StmtGuard stmt;
+  if (sqlite3_prepare_v2(db, kInsertTaskCookieSql, -1, &stmt.stmt, nullptr) !=
+      SQLITE_OK) {
+    throw DL_ABORT_EX(fmt(
+        "sqlite3-persistence: prepare INSERT task cookie failed: %s",
+        sqlite3_errmsg(db)));
+  }
+
+  const auto now = static_cast<time_t>(nowMs / 1000);
+  for (const Cookie* cookie : cookies) {
+    if (cookie->isExpired(now)) {
+      continue;
+    }
+    sqlite3_reset(stmt);
+    sqlite3_clear_bindings(stmt);
+    bindText(stmt, 1, gidHex);
+    bindText(stmt, 2, cookie->getName());
+    bindText(stmt, 3, cookie->getValue());
+    bindText(stmt, 4, cookie->getDomain());
+    bindText(stmt, 5, cookie->getPath());
+    sqlite3_bind_int(stmt, 6, cookie->getHostOnly() ? 1 : 0);
+    sqlite3_bind_int(stmt, 7, cookie->getSecure() ? 1 : 0);
+    sqlite3_bind_int(stmt, 8, cookie->getHttpOnly() ? 1 : 0);
+    sqlite3_bind_int(stmt, 9, cookie->getPersistent() ? 1 : 0);
+    sqlite3_bind_int64(stmt, 10, cookie->getExpiryTime());
+    sqlite3_bind_int64(stmt, 11, cookie->getCreationTime());
+    sqlite3_bind_int64(stmt, 12, cookie->getLastAccessTime());
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+      throw DL_ABORT_EX(fmt(
+          "sqlite3-persistence: INSERT task cookie failed: %s",
+          sqlite3_errmsg(db)));
+    }
+  }
+}
+
+std::string columnText(sqlite3_stmt* stmt, int index)
+{
+  const auto* value =
+      reinterpret_cast<const char*>(sqlite3_column_text(stmt, index));
+  return value ? value : "";
+}
+
+bool taskCookieContextExists(sqlite3* db, const std::string& gidHex)
+{
+  StmtGuard stmt;
+  if (sqlite3_prepare_v2(db, kSelectTaskCookieContextSql, -1, &stmt.stmt,
+                         nullptr) != SQLITE_OK) {
+    throw DL_ABORT_EX(fmt(
+        "sqlite3-persistence: prepare SELECT task cookie context failed: %s",
+        sqlite3_errmsg(db)));
+  }
+  bindText(stmt, 1, gidHex);
+  const int rc = sqlite3_step(stmt);
+  if (rc == SQLITE_ROW) {
+    return true;
+  }
+  if (rc == SQLITE_DONE) {
+    return false;
+  }
+  throw DL_ABORT_EX(fmt(
+      "sqlite3-persistence: SELECT task cookie context failed: %s",
+      sqlite3_errmsg(db)));
+}
+
 } // namespace
 
 Sqlite3SessionStore::Sqlite3SessionStore(Sqlite3PersistenceStore* store)
@@ -141,11 +289,11 @@ void Sqlite3SessionStore::saveAllTasks(RequestGroupMan* rgman)
   // appends via COALESCE(MAX(queue_position)+1, 0). No DELETE on existing
   // rows means no CASCADE on task_progress.
   for (const auto& rg : rgman->getRequestGroups()) {
-    upsertTask(rg);
+    upsertTask(rg, false);
     liveGids.push_back(rg->getGID());
   }
   for (const auto& rg : rgman->getReservedGroups()) {
-    upsertTask(rg);
+    upsertTask(rg, false);
     liveGids.push_back(rg->getGID());
   }
 
@@ -263,11 +411,17 @@ void Sqlite3SessionStore::loadActiveTasksInto(
     return;
   }
 
+  const auto firstLoaded = out.size();
   std::stringstream ss(combined);
   createRequestGroupForUriList(out, op, ss);
+  for (auto i = firstLoaded; i < out.size(); ++i) {
+    restoreTaskCookies(out[i]);
+  }
 }
 
-void Sqlite3SessionStore::upsertTask(const std::shared_ptr<RequestGroup>& rg)
+void Sqlite3SessionStore::upsertTask(
+    const std::shared_ptr<RequestGroup>& rg,
+    bool persistTaskCookieSnapshot)
 {
   // Option A: pass nullptr — renderOneInto never dereferences rgman_.
   SessionSerializer ser(nullptr);
@@ -286,6 +440,9 @@ void Sqlite3SessionStore::upsertTask(const std::shared_ptr<RequestGroup>& rg)
   auto gidHex = GroupId::toHex(rg->getGID());
 
   sqlite3* db = store_->raw();
+  const bool requiresTaskCookies =
+      rg->getOption()->getAsBool(PREF_REQUIRE_TASK_COOKIES);
+  bool persistedTaskCookies = false;
 
   store_->withTransaction([&]() {
     StmtGuard stmt;
@@ -324,7 +481,155 @@ void Sqlite3SessionStore::upsertTask(const std::shared_ptr<RequestGroup>& rg)
           fmt("sqlite3-persistence: UPSERT task failed: %s",
               sqlite3_errmsg(db)));
     }
+
+    if (requiresTaskCookies) {
+      if (rg->getTaskCookieStorage() &&
+          (persistTaskCookieSnapshot ||
+           dirtyTaskCookieGids_.count(gidHex) != 0 ||
+           !taskCookieContextExists(db, gidHex))) {
+        // Periodic task saves avoid rewriting an unchanged jar. A missing
+        // context is still initialized here so derived tasks cannot lose
+        // their inherited cookies before their first HTTP response.
+        replaceTaskCookiesInTransaction(db, gidHex,
+                                        rg->getTaskCookieStorage(), now);
+        persistedTaskCookies = true;
+      }
+    }
+    else {
+      StmtGuard cookieStmt;
+      if (sqlite3_prepare_v2(db, kDeleteTaskCookiesSql, -1,
+                             &cookieStmt.stmt, nullptr) != SQLITE_OK) {
+        throw DL_ABORT_EX(fmt(
+            "sqlite3-persistence: prepare DELETE task cookie context failed: %s",
+            sqlite3_errmsg(db)));
+      }
+      bindText(cookieStmt, 1, gidHex);
+      if (sqlite3_step(cookieStmt) != SQLITE_DONE) {
+        throw DL_ABORT_EX(fmt(
+            "sqlite3-persistence: DELETE task cookie context failed: %s",
+            sqlite3_errmsg(db)));
+      }
+    }
   });
+  if (persistedTaskCookies || !requiresTaskCookies) {
+    dirtyTaskCookieGids_.erase(gidHex);
+  }
+}
+
+void Sqlite3SessionStore::replaceTaskCookies(
+    const std::string& gidHex,
+    const std::shared_ptr<CookieStorage>& storage)
+{
+  sqlite3* db = store_->raw();
+  const auto now = currentUnixMs();
+  store_->withTransaction(
+      [&]() { replaceTaskCookiesInTransaction(db, gidHex, storage, now); });
+  dirtyTaskCookieGids_.erase(gidHex);
+}
+
+void Sqlite3SessionStore::markTaskCookiesDirty(const std::string& gidHex)
+{
+  dirtyTaskCookieGids_.insert(gidHex);
+}
+
+void Sqlite3SessionStore::deleteTaskCookies(const std::string& gidHex)
+{
+  sqlite3* db = store_->raw();
+  store_->withTransaction([&]() {
+    StmtGuard stmt;
+    if (sqlite3_prepare_v2(db, kDeleteTaskCookiesSql, -1, &stmt.stmt,
+                           nullptr) != SQLITE_OK) {
+      throw DL_ABORT_EX(fmt(
+          "sqlite3-persistence: prepare DELETE task cookie context failed: %s",
+          sqlite3_errmsg(db)));
+    }
+    bindText(stmt, 1, gidHex);
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+      throw DL_ABORT_EX(fmt(
+          "sqlite3-persistence: DELETE task cookie context failed: %s",
+          sqlite3_errmsg(db)));
+    }
+  });
+  dirtyTaskCookieGids_.erase(gidHex);
+}
+
+void Sqlite3SessionStore::restoreTaskCookies(
+    const std::shared_ptr<RequestGroup>& rg)
+{
+  if (!rg->getOption()->getAsBool(PREF_REQUIRE_TASK_COOKIES)) {
+    return;
+  }
+
+  sqlite3* db = store_->raw();
+  const auto gidHex = GroupId::toHex(rg->getGID());
+  {
+    StmtGuard stmt;
+    if (sqlite3_prepare_v2(db, kSelectTaskCookieContextSql, -1, &stmt.stmt,
+                           nullptr) != SQLITE_OK) {
+      throw DL_ABORT_EX(fmt(
+          "sqlite3-persistence: prepare SELECT task cookie context failed: %s",
+          sqlite3_errmsg(db)));
+    }
+    bindText(stmt, 1, gidHex);
+    const int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_DONE) {
+      return;
+    }
+    if (rc != SQLITE_ROW) {
+      throw DL_ABORT_EX(fmt(
+          "sqlite3-persistence: SELECT task cookie context failed: %s",
+          sqlite3_errmsg(db)));
+    }
+  }
+
+  const auto now = static_cast<time_t>(currentUnixMs() / 1000);
+  store_->withTransaction([&]() {
+    StmtGuard expiredStmt;
+    if (sqlite3_prepare_v2(db, kDeleteExpiredTaskCookiesSql, -1,
+                           &expiredStmt.stmt, nullptr) != SQLITE_OK) {
+      throw DL_ABORT_EX(fmt(
+          "sqlite3-persistence: prepare DELETE expired task cookies failed: %s",
+          sqlite3_errmsg(db)));
+    }
+    bindText(expiredStmt, 1, gidHex);
+    sqlite3_bind_int64(expiredStmt, 2, static_cast<sqlite3_int64>(now));
+    if (sqlite3_step(expiredStmt) != SQLITE_DONE) {
+      throw DL_ABORT_EX(fmt(
+          "sqlite3-persistence: DELETE expired task cookies failed: %s",
+          sqlite3_errmsg(db)));
+    }
+  });
+
+  auto storage = std::make_shared<CookieStorage>();
+  StmtGuard stmt;
+  if (sqlite3_prepare_v2(db, kSelectTaskCookiesSql, -1, &stmt.stmt, nullptr) !=
+      SQLITE_OK) {
+    throw DL_ABORT_EX(fmt(
+        "sqlite3-persistence: prepare SELECT task cookies failed: %s",
+        sqlite3_errmsg(db)));
+  }
+  bindText(stmt, 1, gidHex);
+
+  int rc;
+  while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+    auto cookie = make_unique<Cookie>(
+        columnText(stmt, 0), columnText(stmt, 1),
+        static_cast<time_t>(sqlite3_column_int64(stmt, 8)),
+        sqlite3_column_int(stmt, 7) != 0, columnText(stmt, 2),
+        sqlite3_column_int(stmt, 4) != 0, columnText(stmt, 3),
+        sqlite3_column_int(stmt, 5) != 0,
+        sqlite3_column_int(stmt, 6) != 0,
+        static_cast<time_t>(sqlite3_column_int64(stmt, 9)));
+    cookie->setLastAccessTime(
+        static_cast<time_t>(sqlite3_column_int64(stmt, 10)));
+    storage->store(std::move(cookie), now);
+  }
+  if (rc != SQLITE_DONE) {
+    throw DL_ABORT_EX(fmt(
+        "sqlite3-persistence: SELECT task cookies failed: %s",
+        sqlite3_errmsg(db)));
+  }
+  rg->setTaskCookieStorage(std::move(storage));
 }
 
 void Sqlite3SessionStore::deleteTask(const std::string& gidHex)
@@ -347,6 +652,7 @@ void Sqlite3SessionStore::deleteTask(const std::string& gidHex)
               sqlite3_errmsg(db)));
     }
   });
+  dirtyTaskCookieGids_.erase(gidHex);
 }
 
 void Sqlite3SessionStore::updateTaskState(const std::string& gidHex,

@@ -6,6 +6,7 @@ import { createServer as createTlsServer } from 'node:https'
 import { mkdtemp, mkdir, readFile, writeFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { fileURLToPath } from 'node:url'
 import { allocPorts, defaultAria2Bin, spawnAria2, stopInstance } from './helpers/aria2-process.mjs'
 import { Aria2Rpc } from './helpers/rpc-client.mjs'
@@ -25,18 +26,22 @@ function handler(req, res) {
     '/redirect-port': otherBase + '/auth',
     '/redirect-http': base + '/auth',
     '/set-cookie': '/auth',
+    '/rotate-cookie': '/blob',
   }
   if (redirects[req.url]) {
     res.writeHead(302, {
       location: redirects[req.url], 'content-length': '0',
       ...(req.url === '/set-cookie' ? { 'set-cookie': 'sid=server-only; Path=/' } : {}),
+      ...(req.url === '/rotate-cookie' ? { 'set-cookie': 'sid=rotated; Path=/' } : {}),
     })
     res.end()
     return
   }
+  const blobAuthorized = ['sid=good', 'sid=rotated']
+    .some(value => req.headers.cookie?.includes(value))
   let body = req.url === '/blob' ? payload : Buffer.from(req.headers.cookie?.includes('sid=good') ? 'REAL_TEST_FILE' : 'COOKIE_REQUIRED')
   const range = /^bytes=(\d+)-(\d*)$/.exec(req.headers.range ?? '')
-  if (req.url === '/blob' && !req.headers.cookie?.includes('sid=good')) {
+  if (req.url === '/blob' && !blobAuthorized) {
     body = Buffer.from('COOKIE_REQUIRED')
   }
   res.setHeader('accept-ranges', 'bytes')
@@ -75,7 +80,7 @@ async function until(get, predicate, timeout = 15000) {
   assert.fail(`Condition timed out: ${JSON.stringify(value)}`)
 }
 
-async function engine(t, { directory, startupJar, restore = false } = {}) {
+async function engine(t, { directory, startupJar, restore = false, pauseOnRestore = true } = {}) {
   const dir = directory ?? path.join(root, `run-${++serial}`)
   await mkdir(dir, { recursive: true })
   const { rpcPort } = allocPorts()
@@ -94,7 +99,10 @@ async function engine(t, { directory, startupJar, restore = false } = {}) {
     '--save-session-interval=1', '--enable-sqlite3-persistence=true',
     `--sqlite3-db-path=${path.join(dir, 'session.db')}`,
     ...(startupJar ? [`--load-cookies=${startupJar}`] : []),
-    ...(restore ? [`--input-file=${path.join(dir, 'session.txt')}`, '--pause=true'] : []),
+    ...(restore ? [
+      `--input-file=${path.join(dir, 'session.txt')}`,
+      ...(pauseOnRestore ? ['--pause=true'] : []),
+    ] : []),
   ]
   const proc = await spawnAria2({ args })
   t.after(() => stopInstance(proc))
@@ -103,11 +111,42 @@ async function engine(t, { directory, startupJar, restore = false } = {}) {
     if (proc.exitCode !== null) assert.fail(`aria2 exited: ${proc.exitCode}`)
     return rpc.call('aria2.getVersion').catch(() => null)
   }, Boolean)
-  return { rpc, dir, stop: () => stopInstance(proc) }
+  return { rpc, dir, stop: (signal = 'SIGTERM') => stopInstance(proc, signal) }
 }
 
 function cookie(value = 'good', extra = {}) {
   return { name: 'sid', value, domain: '127.0.0.1', path: '/', ...extra }
+}
+
+function sqlScalar(e, query, ...params) {
+  const db = new DatabaseSync(path.join(e.dir, 'session.db'), { readOnly: true })
+  try {
+    db.exec('PRAGMA busy_timeout=5000')
+    const row = db.prepare(query).get(...params)
+    return String(Object.values(row)[0])
+  } finally {
+    db.close()
+  }
+}
+
+function sqlRows(e, query, ...params) {
+  const db = new DatabaseSync(path.join(e.dir, 'session.db'), { readOnly: true })
+  try {
+    db.exec('PRAGMA busy_timeout=5000')
+    return db.prepare(query).all(...params)
+  } finally {
+    db.close()
+  }
+}
+
+function runSql(e, query, ...params) {
+  const db = new DatabaseSync(path.join(e.dir, 'session.db'))
+  try {
+    db.exec('PRAGMA busy_timeout=5000')
+    db.prepare(query).run(...params)
+  } finally {
+    db.close()
+  }
 }
 
 async function submit(e, url, cookies, options = {}) {
@@ -263,25 +302,105 @@ describe('task cookie and credential redirect contract', { concurrency: false },
     assert.ok(requests.every(r => r.cookie?.includes('sid=good')))
   })
 
-  it('persists only the requirement marker, fails closed after restart, and can rehydrate a paused task', async t => {
+  it('persists isolated cookie jars, including an empty jar, across restart', async t => {
     const e = await engine(t)
-    const one = await submit(e, base + '/auth', [cookie('NEVER_PERSIST_THIS_COOKIE')], { pause: 'true' })
-    const two = await submit(e, base + '/auth', [cookie('NEVER_PERSIST_THIS_COOKIE')], { pause: 'true' })
+    const one = await submit(e, base + '/auth', [cookie()], { pause: 'true' })
+    const two = await submit(e, base + '/empty', [], { pause: 'true' })
     await e.rpc.saveSession()
     await e.stop()
     const saved = await readFile(path.join(e.dir, 'session.txt'), 'utf8')
     assert.ok(saved.includes('require-task-cookies=true'))
-    for (const filename of ['session.txt', 'session.db', 'engine.log']) {
-      assert.ok(!(await readFile(path.join(e.dir, filename))).includes(Buffer.from('NEVER_PERSIST_THIS_COOKIE')))
+    for (const filename of ['session.txt', 'engine.log']) {
+      assert.ok(!(await readFile(path.join(e.dir, filename))).includes(Buffer.from('sid=good')))
     }
+    const persisted = sqlRows(e,
+      'SELECT gid, value FROM task_cookie ORDER BY gid')
+      .map(({ gid, value }) => ({ gid, value }))
+    assert.deepEqual(persisted, [{ gid: one.gid, value: 'good' }])
+    assert.ok(!persisted.some(row => row.gid === two.gid))
+
     const next = await engine(t, { directory: e.dir, restore: true })
     requests = []
     await next.rpc.unpause(one.gid)
-    const failed = await until(() => next.rpc.tellStatus(one.gid), r => r.status === 'error')
-    assert.match(failed.errorMessage, /cookies.*supplied again/i)
-    assert.equal(requests.length, 0)
-    assert.equal(await next.rpc.call('aria2.setTaskCookies', [two.gid, [cookie()]]), 'OK')
     await next.rpc.unpause(two.gid)
-    assert.equal((await finished(next, two)).toString(), 'REAL_TEST_FILE')
+    assert.equal((await finished(next, one)).toString(), 'REAL_TEST_FILE')
+    assert.equal((await finished(next, two)).toString(), 'COOKIE_REQUIRED')
+    assert.equal(requests.find(r => r.path === '/auth').cookie, 'sid=good;')
+    assert.equal(requests.find(r => r.path === '/empty').cookie, undefined)
+  })
+
+  it('durably replaces a paused task cookie jar through RPC', async t => {
+    const e = await engine(t)
+    const task = await submit(e, base + '/rpc-replaced', [cookie()], {
+      pause: 'true',
+    })
+    await e.rpc.call('aria2.setTaskCookies', [task.gid, [cookie('account-new')]])
+    await e.rpc.saveSession()
+    await e.stop()
+
+    const next = await engine(t, { directory: e.dir, restore: true })
+    requests = []
+    await next.rpc.unpause(task.gid)
+    await finished(next, task)
+    assert.equal(requests.find(request => request.path === '/rpc-replaced').cookie,
+      'sid=account-new;')
+  })
+
+  it('persists a server-rotated cookie before an abrupt process crash', async t => {
+    const e = await engine(t)
+    requests = []
+    const task = await submit(e, base + '/rotate-cookie', [cookie()], {
+      'max-download-limit': '512K',
+    })
+    await until(() => e.rpc.tellStatus(task.gid), status =>
+      status.status === 'active' && Number(status.completedLength) > 0)
+    await until(() => Promise.resolve(sqlScalar(e,
+      'SELECT value FROM task_cookie WHERE gid=?', task.gid)),
+    value => value === 'rotated')
+    await e.rpc.saveSession()
+    await e.stop('SIGKILL')
+
+    const next = await engine(t, { directory: e.dir, restore: true })
+    requests = []
+    await next.rpc.unpause(task.gid)
+    assert.deepEqual(await finished(next, task), payload)
+    assert.ok(requests.some(request =>
+      request.path === '/blob' && request.cookie?.includes('sid=rotated')))
+  })
+
+  it('fails closed when a required durable cookie context is missing', async t => {
+    const e = await engine(t)
+    const task = await submit(e, base + '/auth', [cookie()], { pause: 'true' })
+    await e.rpc.saveSession()
+    await e.stop()
+    runSql(e, 'DELETE FROM task_cookie_context WHERE gid=?', task.gid)
+
+    const next = await engine(t, { directory: e.dir, restore: true })
+    requests = []
+    await next.rpc.unpause(task.gid)
+    const status = await until(() => next.rpc.tellStatus(task.gid),
+      value => value.status === 'error')
+    assert.match(status.errorMessage, /cookie context is unavailable/i)
+    assert.equal(requests.length, 0)
+  })
+
+  it('cleans cookie rows after completion, cancellation and result removal', async t => {
+    const e = await engine(t)
+    const completed = await submit(e, base + '/auth', [cookie()])
+    await finished(e, completed)
+    await until(() => Promise.resolve(sqlScalar(e,
+      'SELECT COUNT(*) FROM task_cookie_context WHERE gid=?', completed.gid)),
+    value => value === '0')
+
+    const cancelled = await submit(e, base + '/auth', [cookie()], { pause: 'true' })
+    assert.equal(sqlScalar(e,
+      'SELECT COUNT(*) FROM task_cookie_context WHERE gid=?', cancelled.gid), '1')
+    await e.rpc.forceRemove(cancelled.gid)
+    await until(() => Promise.resolve(sqlScalar(e,
+      'SELECT COUNT(*) FROM task_cookie_context WHERE gid=?', cancelled.gid)),
+    value => value === '0')
+    await e.rpc.removeDownloadResult(completed.gid)
+    assert.equal(sqlScalar(e,
+      'SELECT COUNT(*) FROM task WHERE gid=?', completed.gid), '0')
   })
 })

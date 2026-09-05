@@ -502,6 +502,13 @@ public:
               ss->deleteTask(GroupId::toHex(group->getGID()));
             }
             else {
+              if (group->getHaltReason() != RequestGroup::SHUTDOWN_SIGNAL) {
+                // A normal completion or terminal error may keep its task row
+                // under --force-save, but no longer needs reusable
+                // credentials. Shutdown is different: it represents an
+                // in-flight task that must resume with the same jar.
+                ss->deleteTaskCookies(GroupId::toHex(group->getGID()));
+              }
               // Force-save preserves the `task` row across this
               // transition; we must also flush the FINAL BT progress
               // (notably `upload_length`) into `task_progress` here.

@@ -7,7 +7,7 @@ on:
     inputs:
       version:
         description: 'Version for a dry run (no leading v)'
-        default: '1.37.0-motrix.13-dev'
+        default: '1.37.0-motrix.14-dev'
 
 permissions:
   contents: write
@@ -401,10 +401,11 @@ jobs:
           'aria2 fork build for Motrix. Base: upstream 1.37.0.' \
           '' \
           'Highlights:' \
-          '- Add aria2.addUriWithCookies and aria2.setTaskCookies for isolated, in-memory task cookies.' \
+          '- Add aria2.addUriWithCookies and aria2.setTaskCookies for isolated, task-scoped cookies.' \
           '- Match cookie domain, path, Secure and expiry on every HTTP request and redirect.' \
           '- Stop forwarding raw Cookie and Authorization headers across origins.' \
-          '- Keep cookie values out of saved sessions and require reauthentication after engine restart.' \
+          '- Restore task cookie jars from dedicated SQLite tables across engine restarts.' \
+          '- Remove task cookie rows on terminal completion, failure, cancellation and result deletion.' \
           '- Gate all six desktop/server release binaries with local HTTP, HTTPS, Range and restart contracts.' \
           '' \
           'All attached archives are covered by SHA256SUMS.' \
