@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity
+      type="win32"
+      name="aria2.aria2c"
+      version="1.0.0.0"
+      processorArchitecture="*"/>
+  <description>aria2c download engine</description>
+  <!--
+    Declare the process long-path aware. Without this, every Win32 path API
+    stays capped at MAX_PATH (260) even on Windows 10 1607+ with the machine's
+    LongPathsEnabled policy turned on, and a deeper destination fails with
+    ERROR_PATH_NOT_FOUND ("The system cannot find the path specified") that
+    reads as a missing directory rather than an over-long path.
+    See agalwood/Motrix#2183.
+  -->
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings
+        xmlns:ws2="http://schemas.microsoft.com/SMI/2016/WindowsSettings">
+      <ws2:longPathAware>true</ws2:longPathAware>
+    </windowsSettings>
+  </application>
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <!-- Windows 10 / 11 -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+    </application>
+  </compatibility>
+</assembly>
