@@ -44,6 +44,7 @@
 #include "fmt.h"
 #include "LogFactory.h"
 #include "Logger.h"
+#include "Sqlite3BtProgressInfoFile.h"
 #include "Sqlite3Migrations.h"
 
 namespace aria2 {
@@ -151,6 +152,9 @@ void Sqlite3PersistenceStore::open()
   }
 
   migrateIfNeeded(*this);
+  // Before any session restore reads the table: reclaim checkpoints that no
+  // task owns and whose data file is gone (see pruneDefunct).
+  Sqlite3BtProgressInfoFile::pruneDefunct(*this);
 }
 
 void Sqlite3PersistenceStore::applyPragmas()

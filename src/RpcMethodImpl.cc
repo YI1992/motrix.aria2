@@ -389,9 +389,8 @@ std::unique_ptr<ValueBase> AddTorrentRpcMethod::process(const RpcRequest& req,
     // container) may pass a freshly-named dir that aria2 would otherwise
     // only auto-create later in BtFileAllocationEntry. If saveAs fails,
     // metaInfoUri stays empty, the task gets a data-only MetadataInfo,
-    // SessionSerializer skips it, the sqlite3-persistence `task` row is
-    // never written, and the next pause hits a FOREIGN KEY violation
-    // when Sqlite3BtProgressInfoFile::save tries to UPSERT task_progress.
+    // SessionSerializer skips it, and the sqlite3-persistence `task` row is
+    // never written, so the task cannot be restored after a restart.
     if (!dirPath.empty()) {
       try {
         util::mkdirs(dirPath);

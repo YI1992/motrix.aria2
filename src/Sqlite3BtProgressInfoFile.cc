@@ -48,6 +48,7 @@
 #include "DlAbortEx.h"
 #include "DownloadContext.h"
 #include "DownloadFailureException.h"
+#include "File.h"
 #include "GroupId.h"
 #include "MessageDigest.h"
 #include "Option.h"
@@ -130,12 +131,17 @@ serializeInFlightPieces(const std::shared_ptr<PieceStorage>& pieceStorage)
   return buf;
 }
 
-const char* const kUpsertSql =
+// A checkpoint is addressed by the output path, like the `.aria2` control
+// file it replaces. out_path is NULL only on rows migrated from schema v2 and
+// on downloads whose path is not resolved yet; both stay reachable by gid.
+const char* const kUpsertByPathSql =
     "INSERT INTO task_progress"
-    " (gid, ctrl_version, is_torrent, info_hash, piece_length, total_length,"
-    "  upload_length, bitfield, in_flight_blob, digest, updated_at)"
-    " VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-    " ON CONFLICT(gid) DO UPDATE SET"
+    " (gid, out_path, ctrl_version, is_torrent, info_hash, piece_length,"
+    "  total_length, upload_length, bitfield, in_flight_blob, digest,"
+    "  updated_at)"
+    " VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    " ON CONFLICT(out_path) DO UPDATE SET"
+    "  gid            = excluded.gid,"
     "  ctrl_version   = excluded.ctrl_version,"
     "  is_torrent     = excluded.is_torrent,"
     "  info_hash      = excluded.info_hash,"
@@ -147,16 +153,55 @@ const char* const kUpsertSql =
     "  digest         = excluded.digest,"
     "  updated_at     = excluded.updated_at";
 
+// Pathless rows have no unique key, so the gid's previous pathless row is
+// dropped first (kDeletePathlessSql) and this is a plain insert.
+const char* const kInsertPathlessSql =
+    "INSERT INTO task_progress"
+    " (gid, out_path, ctrl_version, is_torrent, info_hash, piece_length,"
+    "  total_length, upload_length, bitfield, in_flight_blob, digest,"
+    "  updated_at)"
+    " VALUES (?, NULL, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+
+const char* const kDeletePathlessSql =
+    "DELETE FROM task_progress WHERE gid = ? AND out_path IS NULL";
+
+// ?1 = out_path (may be NULL), ?2 = gid. A path-addressed row wins over a
+// pathless one of the same gid.
 const char* const kSelectSql =
     "SELECT is_torrent, info_hash, piece_length, total_length, upload_length,"
     "       bitfield, in_flight_blob"
-    " FROM task_progress WHERE gid = ? LIMIT 1";
+    " FROM task_progress"
+    " WHERE out_path = ?1 OR (out_path IS NULL AND gid = ?2)"
+    " ORDER BY out_path IS NULL LIMIT 1";
 
 const char* const kExistsSql =
-    "SELECT 1 FROM task_progress WHERE gid = ? LIMIT 1";
+    "SELECT 1 FROM task_progress"
+    " WHERE out_path = ?1 OR (out_path IS NULL AND gid = ?2) LIMIT 1";
 
+// Removing a path's checkpoint must also drop the gid's pathless row, or the
+// gid fallback would resurrect it.
 const char* const kDeleteSql =
-    "DELETE FROM task_progress WHERE gid = ?";
+    "DELETE FROM task_progress"
+    " WHERE out_path = ?1 OR (out_path IS NULL AND gid = ?2)";
+
+const char* const kOrphanSql =
+    "SELECT rowid, out_path FROM task_progress"
+    " WHERE gid NOT IN (SELECT gid FROM task)";
+
+const char* const kDeleteRowSql = "DELETE FROM task_progress WHERE rowid = ?";
+
+// Binds ?1 = out_path (NULL when unresolved) and ?2 = gid.
+void bindIdentity(sqlite3_stmt* stmt, const std::string& outPath,
+                  const std::string& gidHex)
+{
+  if (outPath.empty()) {
+    sqlite3_bind_null(stmt, 1);
+  }
+  else {
+    sqlite3_bind_text(stmt, 1, outPath.data(), outPath.size(), SQLITE_STATIC);
+  }
+  sqlite3_bind_text(stmt, 2, gidHex.data(), gidHex.size(), SQLITE_STATIC);
+}
 
 } // namespace
 
@@ -184,6 +229,7 @@ void Sqlite3BtProgressInfoFile::updateFilename()
     A2_LOG_WARN("sqlite3-persistence: Sqlite3BtProgressInfoFile constructed"
                 " without owning RequestGroup; gidHex remains empty");
   }
+  outPath_ = dctx_->getBasePath();
   filename_ = "sqlite3://" + store_->path() + "#" + gidHex_;
 }
 
@@ -197,7 +243,7 @@ bool Sqlite3BtProgressInfoFile::exists()
                     sqlite3_errmsg(db)));
     return false;
   }
-  sqlite3_bind_text(stmt, 1, gidHex_.data(), gidHex_.size(), SQLITE_STATIC);
+  bindIdentity(stmt, outPath_, gidHex_);
   int rc = sqlite3_step(stmt);
   return rc == SQLITE_ROW;
 }
@@ -244,50 +290,69 @@ void Sqlite3BtProgressInfoFile::save()
   sqlite3* db = store_->raw();
 
   store_->withTransaction([&]() {
+    // A pathless row of this gid is either a schema-v2 leftover or an earlier
+    // save made before the path resolved. Either way this save supersedes it.
+    {
+      StmtGuard del;
+      if (sqlite3_prepare_v2(db, kDeletePathlessSql, -1, &del.stmt,
+                             nullptr) != SQLITE_OK) {
+        throw DL_ABORT_EX(fmt("sqlite3-persistence: prepare DELETE pathless"
+                              " task_progress failed: %s",
+                              sqlite3_errmsg(db)));
+      }
+      sqlite3_bind_text(del, 1, gidHex_.data(), gidHex_.size(), SQLITE_STATIC);
+      if (sqlite3_step(del) != SQLITE_DONE) {
+        throw DL_ABORT_EX(
+            fmt("sqlite3-persistence: DELETE pathless task_progress failed: %s",
+                sqlite3_errmsg(db)));
+      }
+    }
+
+    const bool byPath = !outPath_.empty();
     StmtGuard stmt;
-    if (sqlite3_prepare_v2(db, kUpsertSql, -1, &stmt.stmt, nullptr) !=
-        SQLITE_OK) {
+    if (sqlite3_prepare_v2(db, byPath ? kUpsertByPathSql : kInsertPathlessSql,
+                           -1, &stmt.stmt, nullptr) != SQLITE_OK) {
       throw DL_ABORT_EX(fmt("sqlite3-persistence: prepare UPSERT task_progress"
                             " failed: %s",
                             sqlite3_errmsg(db)));
     }
 
-    // 1: gid
-    sqlite3_bind_text(stmt, 1, gidHex_.data(), gidHex_.size(), SQLITE_STATIC);
-    // 2: is_torrent
-    sqlite3_bind_int(stmt, 2, isTorrent ? 1 : 0);
-    // 3: info_hash
+    // The pathless statement has no out_path parameter, so every later
+    // column shifts one place left.
+    int col = 1;
+    sqlite3_bind_text(stmt, col++, gidHex_.data(), gidHex_.size(),
+                      SQLITE_STATIC);
+    if (byPath) {
+      sqlite3_bind_text(stmt, col++, outPath_.data(), outPath_.size(),
+                        SQLITE_STATIC);
+    }
+    sqlite3_bind_int(stmt, col++, isTorrent ? 1 : 0);
 #ifdef ENABLE_BITTORRENT
     if (isTorrent) {
       const unsigned char* infoHash = bittorrent::getInfoHash(dctx_);
-      sqlite3_bind_blob(stmt, 3, infoHash, INFO_HASH_LENGTH, SQLITE_STATIC);
+      sqlite3_bind_blob(stmt, col++, infoHash, INFO_HASH_LENGTH,
+                        SQLITE_STATIC);
     }
     else {
-      sqlite3_bind_null(stmt, 3);
+      sqlite3_bind_null(stmt, col++);
     }
 #else
-    sqlite3_bind_null(stmt, 3);
+    sqlite3_bind_null(stmt, col++);
 #endif
-    // 4: piece_length
-    sqlite3_bind_int64(stmt, 4,
+    sqlite3_bind_int64(stmt, col++,
                        static_cast<sqlite3_int64>(dctx_->getPieceLength()));
-    // 5: total_length
-    sqlite3_bind_int64(stmt, 5,
+    sqlite3_bind_int64(stmt, col++,
                        static_cast<sqlite3_int64>(dctx_->getTotalLength()));
-    // 6: upload_length
-    sqlite3_bind_int64(stmt, 6, static_cast<sqlite3_int64>(uploadLength));
-    // 7: bitfield
-    sqlite3_bind_blob(stmt, 7, pieceStorage_->getBitfield(),
+    sqlite3_bind_int64(stmt, col++, static_cast<sqlite3_int64>(uploadLength));
+    sqlite3_bind_blob(stmt, col++, pieceStorage_->getBitfield(),
                       static_cast<int>(pieceStorage_->getBitfieldLength()),
                       SQLITE_STATIC);
-    // 8: in_flight_blob
-    sqlite3_bind_blob(stmt, 8, payload.data(),
+    sqlite3_bind_blob(stmt, col++, payload.data(),
                       static_cast<int>(payload.size()), SQLITE_TRANSIENT);
-    // 9: digest
-    sqlite3_bind_blob(stmt, 9, digest.data(),
+    sqlite3_bind_blob(stmt, col++, digest.data(),
                       static_cast<int>(digest.size()), SQLITE_TRANSIENT);
-    // 10: updated_at
-    sqlite3_bind_int64(stmt, 10, static_cast<sqlite3_int64>(currentUnixMs()));
+    sqlite3_bind_int64(stmt, col++,
+                       static_cast<sqlite3_int64>(currentUnixMs()));
 
     if (sqlite3_step(stmt) != SQLITE_DONE) {
       throw DL_ABORT_EX(
@@ -314,7 +379,7 @@ void Sqlite3BtProgressInfoFile::load()
         fmt("sqlite3-persistence: prepare SELECT task_progress failed: %s",
             sqlite3_errmsg(db)));
   }
-  sqlite3_bind_text(stmt, 1, gidHex_.data(), gidHex_.size(), SQLITE_STATIC);
+  bindIdentity(stmt, outPath_, gidHex_);
 
   int rc = sqlite3_step(stmt);
   if (rc != SQLITE_ROW) {
@@ -515,12 +580,65 @@ void Sqlite3BtProgressInfoFile::removeFile()
         fmt("sqlite3-persistence: prepare DELETE task_progress failed: %s",
             sqlite3_errmsg(db)));
   }
-  sqlite3_bind_text(stmt, 1, gidHex_.data(), gidHex_.size(), SQLITE_STATIC);
+  bindIdentity(stmt, outPath_, gidHex_);
   if (sqlite3_step(stmt) != SQLITE_DONE) {
     throw DL_ABORT_EX(
         fmt("sqlite3-persistence: DELETE task_progress failed: %s",
             sqlite3_errmsg(db)));
   }
+}
+
+void Sqlite3BtProgressInfoFile::pruneDefunct(Sqlite3PersistenceStore& store)
+{
+  // Mirrors RequestGroup::removeDefunctControlFile for checkpoints whose
+  // download will never be started again to trigger it: no task row owns
+  // them, so nothing reopens the path. A checkpoint whose data file still
+  // exists is kept — that is exactly the errored download a retry resumes.
+  sqlite3* db = store.raw();
+  std::vector<sqlite3_int64> doomed;
+  {
+    StmtGuard stmt;
+    if (sqlite3_prepare_v2(db, kOrphanSql, -1, &stmt.stmt, nullptr) !=
+        SQLITE_OK) {
+      A2_LOG_WARN(fmt("sqlite3-persistence: prepare orphan task_progress scan"
+                      " failed: %s",
+                      sqlite3_errmsg(db)));
+      return;
+    }
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+      const unsigned char* path = sqlite3_column_text(stmt, 1);
+      // A pathless orphan is a schema-v2 row whose task is gone: v2 would
+      // have cascaded it away, and nothing can find it by path.
+      if (!path ||
+          !File(reinterpret_cast<const char*>(path)).exists()) {
+        doomed.push_back(sqlite3_column_int64(stmt, 0));
+      }
+    }
+  }
+  if (doomed.empty()) {
+    return;
+  }
+  store.withTransaction([&]() {
+    StmtGuard del;
+    if (sqlite3_prepare_v2(db, kDeleteRowSql, -1, &del.stmt, nullptr) !=
+        SQLITE_OK) {
+      throw DL_ABORT_EX(fmt("sqlite3-persistence: prepare DELETE task_progress"
+                            " row failed: %s",
+                            sqlite3_errmsg(db)));
+    }
+    for (auto rowid : doomed) {
+      sqlite3_reset(del);
+      sqlite3_bind_int64(del, 1, rowid);
+      if (sqlite3_step(del) != SQLITE_DONE) {
+        throw DL_ABORT_EX(
+            fmt("sqlite3-persistence: DELETE task_progress row failed: %s",
+                sqlite3_errmsg(db)));
+      }
+    }
+  });
+  A2_LOG_NOTICE(fmt("sqlite3-persistence: pruned %zu defunct task_progress"
+                    " row(s)",
+                    doomed.size()));
 }
 
 #ifdef ENABLE_BITTORRENT
