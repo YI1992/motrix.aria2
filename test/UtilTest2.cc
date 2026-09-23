@@ -56,6 +56,7 @@ class UtilTest2 : public CppUnit::TestFixture {
   CPPUNIT_TEST(testParsePrioritizePieceRange);
   CPPUNIT_TEST(testApplyDir);
   CPPUNIT_TEST(testFixTaintedBasename);
+  CPPUNIT_TEST(testToWin32VerbatimPath);
   CPPUNIT_TEST(testIsNumericHost);
   CPPUNIT_TEST(testDetectDirTraversal);
   CPPUNIT_TEST(testEscapePath);
@@ -106,6 +107,7 @@ public:
   void testParsePrioritizePieceRange();
   void testApplyDir();
   void testFixTaintedBasename();
+  void testToWin32VerbatimPath();
   void testIsNumericHost();
   void testDetectDirTraversal();
   void testEscapePath();
@@ -791,6 +793,30 @@ void UtilTest2::testApplyDir()
   CPPUNIT_ASSERT_EQUAL(std::string("C:/download/file"),
                        util::applyDir("D:/aria2", "C:/download/file"));
 #endif // __MINGW32__
+}
+
+void UtilTest2::testToWin32VerbatimPath()
+{
+  // Input is GetFullPathNameW's output: absolute, "\"-separated, normalized.
+  // Only the prefix is decided here, following Rust std's get_long_path.
+  // Drive paths: C:\ => \\?\C:\ .
+  CPPUNIT_ASSERT(std::wstring(L"\\\\?\\F:\\Game\\a.flac") ==
+                 util::toWin32VerbatimPath(L"F:\\Game\\a.flac"));
+  // UNC paths: \\server\share => \\?\UNC\server\share
+  CPPUNIT_ASSERT(std::wstring(L"\\\\?\\UNC\\nas\\share\\dl\\f") ==
+                 util::toWin32VerbatimPath(L"\\\\nas\\share\\dl\\f"));
+  // Win32 device paths: \\.\ => \\?\ .
+  CPPUNIT_ASSERT(std::wstring(L"\\\\?\\C:\\x") ==
+                 util::toWin32VerbatimPath(L"\\\\.\\C:\\x"));
+  // Already verbatim or NT paths stay as they are.
+  CPPUNIT_ASSERT(std::wstring(L"\\\\?\\C:\\x") ==
+                 util::toWin32VerbatimPath(L"\\\\?\\C:\\x"));
+  CPPUNIT_ASSERT(std::wstring(L"\\??\\C:\\x") ==
+                 util::toWin32VerbatimPath(L"\\??\\C:\\x"));
+  // Anything else is left alone rather than guessed at.
+  CPPUNIT_ASSERT(std::wstring(L"relative\\f") ==
+                 util::toWin32VerbatimPath(L"relative\\f"));
+  CPPUNIT_ASSERT(std::wstring(L"") == util::toWin32VerbatimPath(L""));
 }
 
 void UtilTest2::testFixTaintedBasename()

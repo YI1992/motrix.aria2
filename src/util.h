@@ -104,8 +104,17 @@ std::string wCharToUtf8(const std::wstring& wsrc);
 
 // replace any backslash '\' in |src| with '/' and returns it.
 std::string toForwardSlash(const std::string& src);
+
+// utf8ToWChar for a filesystem path. A path long enough to hit the Win32
+// MAX_PATH limit is normalized by GetFullPathNameW — the same rules Win32
+// applies to short paths — and passed in the \\?\ namespace, so deep
+// download destinations open without the LongPathsEnabled policy. Shorter
+// paths convert exactly as utf8ToWChar does. Mirrors Rust std's
+// get_long_path and Go's os.fixLongPath.
+std::wstring utf8ToWPath(const std::string& path);
 #else // !__MINGW32__
 #  define utf8ToWChar(src) src
+#  define utf8ToWPath(src) src
 #  define utf8ToNative(src) src
 #endif // !__MINGW32__
 
@@ -738,6 +747,15 @@ std::string applyDir(const std::string& dir, const std::string& relPath);
 // replaces '/' with '_' and result string is passed to escapePath()
 // function and its result is returned.
 std::string fixTaintedBasename(const std::string& src);
+
+// Prefix an absolute, normalized Windows path (GetFullPathNameW output) for
+// the \\?\ namespace, which Win32 hands to the filesystem without the
+// MAX_PATH-limited parsing: C:\ => \\?\C:\, \\server\share =>
+// \\?\UNC\server\share, \\.\ => \\?\. Verbatim (\\?\) and NT (\??\)
+// paths, and anything unrecognized, are returned unchanged. The prefix rules
+// follow Rust std's get_long_path. Compiled on every platform so it can be
+// unit tested; utf8ToWPath is the Windows caller.
+std::wstring toWin32VerbatimPath(const std::wstring& fullPath);
 
 // Generates 20 bytes random key and store it to the address pointed
 // by key.  Caller must allocate at least 20 bytes for generated key.

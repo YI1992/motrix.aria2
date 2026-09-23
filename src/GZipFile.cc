@@ -51,7 +51,7 @@ GZipFile::GZipFile(const char* filename, const char* mode)
           ? stdin
           :
 #ifdef __MINGW32__
-          a2fopen(utf8ToWChar(filename).c_str(), utf8ToWChar(mode).c_str())
+          a2fopen(utf8ToWPath(filename).c_str(), utf8ToWChar(mode).c_str())
 #else  // !__MINGW32__
           a2fopen(filename, mode)
 #endif // !__MINGW32__
