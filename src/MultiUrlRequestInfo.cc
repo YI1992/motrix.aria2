@@ -318,16 +318,17 @@ int MultiUrlRequestInfo::prepare()
       setupSignalHandlers();
     }
 #ifdef HAVE_SQLITE3
-    // Pre-flight: write the initial task table so subsequent task_progress
-    // UPSERTs (which CASCADE FK to task) can find their parent rows.
+    // Pre-flight: write the initial task table so a crash before the first
+    // periodic save still leaves every task restorable. (task_progress no
+    // longer references task since schema v3, so its writes do not depend on
+    // this.)
     if (auto* sessionStore = e_->getSqlite3SessionStore()) {
       try {
         sessionStore->saveAllTasks(e_->getRequestGroupMan().get());
       }
       catch (RecoverableException& ex) {
         A2_LOG_WARN_EX("sqlite3-persistence: startup save failed; "
-                       "task_progress writes may FK-fail until next periodic "
-                       "save",
+                       "tasks rely on the next periodic save",
                        ex);
       }
     }

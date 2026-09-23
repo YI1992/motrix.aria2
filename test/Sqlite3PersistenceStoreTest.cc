@@ -1,4 +1,5 @@
 #include "Sqlite3PersistenceStore.h"
+#include "Sqlite3Migrations.h"
 
 #include <cstdio>
 #include <fstream>
@@ -72,7 +73,8 @@ void Sqlite3PersistenceStoreTest::testCorruptDbRenamedAndRebuilt()
     store.open();
 
     // Fresh DB must have been migrated to the current schema.
-    CPPUNIT_ASSERT_EQUAL(std::string("2"), store.queryPragma("user_version"));
+    CPPUNIT_ASSERT_EQUAL(std::to_string(kCurrentSchemaVersion),
+                         store.queryPragma("user_version"));
   }
 
   // Verify at least one sibling .corrupt.* file was created.

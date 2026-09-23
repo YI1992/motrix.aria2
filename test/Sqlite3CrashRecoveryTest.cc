@@ -73,6 +73,7 @@
 #include "a2functional.h"
 #include "RecoverableException.h"
 #include "Sqlite3PersistenceStore.h"
+#include "Sqlite3Migrations.h"
 
 namespace aria2 {
 
@@ -441,8 +442,8 @@ void Sqlite3CrashRecoveryTest::testCorruptByteMangleRebuild()
     CPPUNIT_ASSERT_MESSAGE("rebuilt DB must pass quick_check",
                            quickCheckOk(store.raw()));
 
-    CPPUNIT_ASSERT_EQUAL_MESSAGE("rebuilt DB must have user_version=2",
-                                 std::string("2"),
+    CPPUNIT_ASSERT_EQUAL_MESSAGE("rebuilt DB must be at the current schema",
+                                 std::to_string(kCurrentSchemaVersion),
                                  store.queryPragma("user_version"));
 
     int64_t cnt = countRows(store.raw(), "task");

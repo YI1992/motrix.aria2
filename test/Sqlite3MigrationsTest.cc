@@ -16,6 +16,7 @@ class Sqlite3MigrationsTest : public CppUnit::TestFixture {
   CPPUNIT_TEST_SUITE(Sqlite3MigrationsTest);
   CPPUNIT_TEST(testMigrateFreshDbToV2);
   CPPUNIT_TEST(testMigrateExistingV1ToV2);
+  CPPUNIT_TEST(testMigrateV2ToV3DetachesProgressFromTask);
   CPPUNIT_TEST(testReopenIsIdempotent);
   CPPUNIT_TEST(testFutureVersionRejected);
   CPPUNIT_TEST_SUITE_END();
@@ -23,6 +24,7 @@ class Sqlite3MigrationsTest : public CppUnit::TestFixture {
 public:
   void testMigrateFreshDbToV2();
   void testMigrateExistingV1ToV2();
+  void testMigrateV2ToV3DetachesProgressFromTask();
   void testReopenIsIdempotent();
   void testFutureVersionRejected();
 };
@@ -57,7 +59,8 @@ void Sqlite3MigrationsTest::testMigrateFreshDbToV2() {
     CPPUNIT_ASSERT_MESSAGE(std::string("missing table: ") + t,
                            std::find(names.begin(), names.end(), t) != names.end());
   }
-  CPPUNIT_ASSERT_EQUAL(std::string("2"), store.queryPragma("user_version"));
+  CPPUNIT_ASSERT_EQUAL(std::to_string(kCurrentSchemaVersion),
+                         store.queryPragma("user_version"));
 }
 
 void Sqlite3MigrationsTest::testMigrateExistingV1ToV2() {
@@ -82,8 +85,92 @@ void Sqlite3MigrationsTest::testMigrateExistingV1ToV2() {
                              "task_cookie_context") != names.end());
     CPPUNIT_ASSERT(std::find(names.begin(), names.end(), "task_cookie") !=
                    names.end());
-    CPPUNIT_ASSERT_EQUAL(std::string("2"),
+    CPPUNIT_ASSERT_EQUAL(std::to_string(kCurrentSchemaVersion),
                          store.queryPragma("user_version"));
+  }
+}
+
+void Sqlite3MigrationsTest::testMigrateV2ToV3DetachesProgressFromTask() {
+  std::string path = std::string(A2_TEST_OUT_DIR) + "/test_migrate_v2_to_v3.db";
+  std::remove(path.c_str());
+  std::remove((path + "-wal").c_str());
+  std::remove((path + "-shm").c_str());
+  auto exec = [](sqlite3* db, const char* sql) {
+    char* err = nullptr;
+    int rc = sqlite3_exec(db, sql, nullptr, nullptr, &err);
+    std::string msg = err ? err : "";
+    sqlite3_free(err);
+    CPPUNIT_ASSERT_EQUAL_MESSAGE(msg, SQLITE_OK, rc);
+  };
+  // Rebuild a schema-v2 database: task_progress keyed by gid with the
+  // CASCADE into task, holding one checkpoint.
+  {
+    Sqlite3PersistenceStore store(path);
+    store.open();
+    sqlite3* db = store.raw();
+    exec(db, "DROP TABLE task_progress");
+    exec(db,
+         "CREATE TABLE task_progress ("
+         "  gid TEXT PRIMARY KEY,"
+         "  ctrl_version INTEGER NOT NULL DEFAULT 1,"
+         "  is_torrent INTEGER NOT NULL DEFAULT 0,"
+         "  info_hash BLOB,"
+         "  piece_length INTEGER NOT NULL,"
+         "  total_length INTEGER NOT NULL,"
+         "  upload_length INTEGER NOT NULL DEFAULT 0,"
+         "  bitfield BLOB NOT NULL,"
+         "  in_flight_blob BLOB NOT NULL DEFAULT X'',"
+         "  digest BLOB NOT NULL,"
+         "  updated_at INTEGER NOT NULL,"
+         "  FOREIGN KEY (gid) REFERENCES task(gid) ON DELETE CASCADE)");
+    exec(db,
+         "INSERT INTO task(gid, state, serialized, queue_position, digest,"
+         " created_at, updated_at)"
+         " VALUES ('00000000000000aa', 'waiting', '', 0, X'', 0, 0)");
+    exec(db,
+         "INSERT INTO task_progress(gid, piece_length, total_length, bitfield,"
+         " digest, updated_at)"
+         " VALUES ('00000000000000aa', 1024, 2048, X'80', X'', 1)");
+    exec(db, "UPDATE meta SET value='2' WHERE key='schema_version'");
+    exec(db, "PRAGMA user_version=2");
+  }
+  {
+    Sqlite3PersistenceStore store(path);
+    store.open();
+    sqlite3* db = store.raw();
+    CPPUNIT_ASSERT_EQUAL(std::to_string(kCurrentSchemaVersion),
+                         store.queryPragma("user_version"));
+
+    auto countRows = [&](const char* sql) {
+      sqlite3_stmt* stmt = nullptr;
+      CPPUNIT_ASSERT_EQUAL(SQLITE_OK,
+                           sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr));
+      CPPUNIT_ASSERT_EQUAL(SQLITE_ROW, sqlite3_step(stmt));
+      int n = sqlite3_column_int(stmt, 0);
+      sqlite3_finalize(stmt);
+      return n;
+    };
+    // The legacy checkpoint survives, marked as not yet path-addressed.
+    CPPUNIT_ASSERT_EQUAL(
+        1, countRows("SELECT COUNT(*) FROM task_progress"
+                     " WHERE gid = '00000000000000aa' AND out_path IS NULL"));
+    // Deleting the task row no longer destroys the checkpoint.
+    exec(db, "DELETE FROM task WHERE gid = '00000000000000aa'");
+    CPPUNIT_ASSERT_EQUAL(
+        1, countRows("SELECT COUNT(*) FROM task_progress"
+                     " WHERE gid = '00000000000000aa'"));
+    // One checkpoint per output path.
+    exec(db,
+         "INSERT INTO task_progress(gid, out_path, piece_length, total_length,"
+         " bitfield, digest, updated_at)"
+         " VALUES ('00000000000000bb', '/d/x', 1024, 2048, X'80', X'', 1)");
+    CPPUNIT_ASSERT(sqlite3_exec(db,
+                                "INSERT INTO task_progress(gid, out_path,"
+                                " piece_length, total_length, bitfield,"
+                                " digest, updated_at) VALUES"
+                                " ('00000000000000cc', '/d/x', 1024, 2048,"
+                                " X'80', X'', 1)",
+                                nullptr, nullptr, nullptr) != SQLITE_OK);
   }
 }
 
@@ -94,13 +181,15 @@ void Sqlite3MigrationsTest::testReopenIsIdempotent() {
   {
     Sqlite3PersistenceStore store(path);
     store.open();
-    CPPUNIT_ASSERT_EQUAL(std::string("2"), store.queryPragma("user_version"));
+    CPPUNIT_ASSERT_EQUAL(std::to_string(kCurrentSchemaVersion),
+                         store.queryPragma("user_version"));
   }
   // Second open: must not throw and must keep the current schema version.
   {
     Sqlite3PersistenceStore store(path);
     store.open();
-    CPPUNIT_ASSERT_EQUAL(std::string("2"), store.queryPragma("user_version"));
+    CPPUNIT_ASSERT_EQUAL(std::to_string(kCurrentSchemaVersion),
+                         store.queryPragma("user_version"));
   }
 }
 

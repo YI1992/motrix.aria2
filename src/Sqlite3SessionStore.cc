@@ -287,7 +287,8 @@ void Sqlite3SessionStore::saveAllTasks(RequestGroupMan* rgman)
   // Step 1: UPSERT each active + reserved RG. upsertTask preserves
   // created_at and queue_position on conflict (Task 17), and the INSERT path
   // appends via COALESCE(MAX(queue_position)+1, 0). No DELETE on existing
-  // rows means no CASCADE on task_progress.
+  // rows. (task_progress is path-addressed and independent of task rows
+  // since schema v3; see Sqlite3BtProgressInfoFile::pruneDefunct.)
   for (const auto& rg : rgman->getRequestGroups()) {
     upsertTask(rg, false);
     liveGids.push_back(rg->getGID());
@@ -320,8 +321,8 @@ void Sqlite3SessionStore::saveAllTasks(RequestGroupMan* rgman)
 
   // Step 2: orphan removal. Any task row whose gid is no longer in the
   // active+reserved+stopped set represents a row that was never paired
-  // with a RG / DownloadResult in this session — CASCADE on its
-  // task_progress is then correct.
+  // with a RG / DownloadResult in this session. Its checkpoint, if any, is
+  // kept while the data file exists so a front-end retry can resume it.
   removeOrphanTasks(liveGids);
 }
 

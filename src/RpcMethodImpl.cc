@@ -33,6 +33,8 @@
  */
 /* copyright --> */
 #include "RpcMethodImpl.h"
+
+#include "BtProgressInfoFileFactory.h"
 #include "RpcCookie.h"
 
 #include <cassert>
@@ -389,9 +391,8 @@ std::unique_ptr<ValueBase> AddTorrentRpcMethod::process(const RpcRequest& req,
     // container) may pass a freshly-named dir that aria2 would otherwise
     // only auto-create later in BtFileAllocationEntry. If saveAs fails,
     // metaInfoUri stays empty, the task gets a data-only MetadataInfo,
-    // SessionSerializer skips it, the sqlite3-persistence `task` row is
-    // never written, and the next pause hits a FOREIGN KEY violation
-    // when Sqlite3BtProgressInfoFile::save tries to UPSERT task_progress.
+    // SessionSerializer skips it, and the sqlite3-persistence `task` row is
+    // never written, so the task cannot be restored after a restart.
     if (!dirPath.empty()) {
       try {
         util::mkdirs(dirPath);
@@ -1629,6 +1630,20 @@ GetGlobalStatRpcMethod::process(const RpcRequest& req, DownloadEngine* e)
   res->put(KEY_NUM_STOPPED_TOTAL, util::uitos(rgman->getNumStoppedTotal()));
   res->put(KEY_NUM_ACTIVE, util::uitos(rgman->getRequestGroups().size()));
   return std::move(res);
+}
+
+std::unique_ptr<ValueBase>
+GetCheckpointStatusRpcMethod::process(const RpcRequest& req, DownloadEngine* e)
+{
+  const String* pathParam = checkRequiredParam<String>(req, 0);
+  if (pathParam->s().empty()) {
+    throw DL_ABORT_EX("Output path must not be empty.");
+  }
+  auto r = Dict::g();
+  r->put("exists", hasCheckpointForPath(pathParam->s(), e) ? VLB_TRUE
+                                                           : VLB_FALSE);
+  r->put("store", checkpointStoreName(e));
+  return std::move(r);
 }
 
 std::unique_ptr<ValueBase> SaveSessionRpcMethod::process(const RpcRequest& req,

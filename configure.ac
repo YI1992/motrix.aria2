@@ -925,6 +925,13 @@ case "$host" in
     AM_CONDITIONAL([HAVE_GETADDRINFO], true)
     dnl defined in ws2tcpip.h, but missing in C:\mingw\lib\libws2_32.a
     AM_CONDITIONAL([HAVE_GAI_STRERROR], false)
+    dnl aria2c.rc embeds the long-path-aware manifest; a resource compiler is
+    dnl mandatory on Windows hosts, since silently dropping the manifest caps
+    dnl every path at MAX_PATH again (Motrix#2183).
+    AC_CHECK_TOOL([WINDRES], [windres], [no])
+    if test "x$WINDRES" = "xno"; then
+      AC_MSG_ERROR([windres is required for the Windows build (aria2c.rc)])
+    fi
     ;;
   *)
     AM_CONDITIONAL([MINGW_BUILD], false)

@@ -70,6 +70,25 @@ public:
   void removeFile() CXX11_OVERRIDE;
   void updateFilename() CXX11_OVERRIDE;
 
+  // Drop checkpoints that no task row owns and whose data file no longer
+  // exists. Without a foreign key into `task`, nothing else reclaims the
+  // checkpoint of a download the front-end removed together with its files.
+  static void pruneDefunct(Sqlite3PersistenceStore& store);
+
+  // Whether a checkpoint is saved for this output path. `windowsPaths`
+  // compares separator- and case-insensitively: aria2 joins --dir and --out
+  // with "/" on every platform, and NTFS ignores letter case, so a front-end
+  // spelling the same path natively must still find it.
+  static bool existsForPath(Sqlite3PersistenceStore& store,
+                            const std::string& path,
+                            bool windowsPaths
+#ifdef __MINGW32__
+                            = true
+#else
+                            = false
+#endif
+  );
+
 #ifdef ENABLE_BITTORRENT
   void setBtRuntime(
       const std::shared_ptr<BtRuntime>& btRuntime) CXX11_OVERRIDE;
@@ -87,6 +106,10 @@ private:
   const Option* option_;
   Sqlite3PersistenceStore* store_; // non-owning
   std::string gidHex_;
+  // Output path the checkpoint belongs to — the same identity a `.aria2`
+  // control file takes from its name. A retry that re-adds the download under
+  // a new gid finds the checkpoint through this path, not through the gid.
+  std::string outPath_;
   std::string filename_;
   std::string lastDigest_;
 };

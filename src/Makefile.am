@@ -281,7 +281,19 @@ SRCS =  \
 
 if MINGW_BUILD
 SRCS += WinConsoleFile.cc WinConsoleFile.h
+
+# Compile the Windows resource script. `longPathAware` in aria2c.manifest is
+# what lifts the process off the MAX_PATH (260) cap, so a deeply nested BT
+# destination opens instead of failing with ERROR_PATH_NOT_FOUND
+# (Motrix#2183). Automake has no built-in .rc rule; the object is linked in
+# via LDADD below, after LDADD itself is defined.
+aria2c_rc.$(OBJEXT): $(srcdir)/aria2c.rc $(srcdir)/aria2c.manifest
+	$(AM_V_GEN)$(WINDRES) -I$(srcdir) -i $(srcdir)/aria2c.rc -o $@
+
+CLEANFILES = aria2c_rc.$(OBJEXT)
 endif # MINGW_BUILD
+
+EXTRA_DIST = aria2c.rc aria2c.manifest
 
 if ENABLE_WEBSOCKET
 SRCS += \
@@ -759,6 +771,12 @@ libaria2_la_LIBADD = $(EXTLDADD)
 else # !ENABLE_LIBARIA2
 LDADD += $(EXTLDADD)
 endif # !ENABLE_LIBARIA2
+
+if MINGW_BUILD
+# Named literally (not through a variable) so automake still derives
+# aria2c_DEPENDENCIES from LDADD and rebuilds the exe when the manifest moves.
+LDADD += aria2c_rc.$(OBJEXT)
+endif # MINGW_BUILD
 
 AM_CFLAGS = @EXTRACFLAGS@
 

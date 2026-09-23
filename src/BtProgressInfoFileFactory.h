@@ -38,6 +38,7 @@
 #include "common.h"
 
 #include <memory>
+#include <string>
 
 namespace aria2 {
 
@@ -51,6 +52,16 @@ std::shared_ptr<BtProgressInfoFile>
 makeBtProgressInfoFile(const std::shared_ptr<DownloadContext>& dctx,
                        const std::shared_ptr<PieceStorage>& pieceStorage,
                        const Option* option, DownloadEngine* engine);
+
+// Whether the checkpoint store this engine reads holds a resumable checkpoint
+// for the download written to `path`. It is the answer
+// makeBtProgressInfoFile(...)->exists() would give for a download of that
+// path, available without creating one. Front-ends use it to decide whether a
+// retry can resume a partial file.
+bool hasCheckpointForPath(const std::string& path, DownloadEngine* engine);
+
+// "sqlite3" or "control-file": which store hasCheckpointForPath consulted.
+const char* checkpointStoreName(DownloadEngine* engine);
 
 } // namespace aria2
 

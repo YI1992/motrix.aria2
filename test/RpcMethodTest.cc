@@ -9,6 +9,8 @@
 #include "RequestGroupMan.h"
 #include "RequestGroup.h"
 #include "RpcMethodImpl.h"
+
+#include <fstream>
 #include "RpcCookie.h"
 #include "CookieStorage.h"
 #include "Cookie.h"
@@ -26,6 +28,9 @@
 #include "FileEntry.h"
 #include "File.h"
 #include "RpcMethodFactory.h"
+#ifdef HAVE_SQLITE3
+#  include "Sqlite3BtProgressInfoFile.h"
+#endif
 #ifdef ENABLE_BITTORRENT
 #  include "BtRegistry.h"
 #  include "BtRuntime.h"
@@ -101,7 +106,11 @@ class RpcMethodTest : public CppUnit::TestFixture {
   CPPUNIT_TEST(testSystemMulticall_fail);
   CPPUNIT_TEST(testSystemListMethods);
   CPPUNIT_TEST(testSystemListNotifications);
+  CPPUNIT_TEST(testGetCheckpointStatusControlFile);
+  CPPUNIT_TEST(testGetCheckpointStatusRejectsMissingPath);
 #ifdef HAVE_SQLITE3
+  CPPUNIT_TEST(testGetCheckpointStatusSqlite3);
+  CPPUNIT_TEST(testCheckpointLookupWindowsSemantics);
   CPPUNIT_TEST(testSystemListMethodsExcludesSqlite3WhenDisabled);
   CPPUNIT_TEST(testSaveSessionRpcWritesBothBackends);
   CPPUNIT_TEST(testChangeOptionPersistsToDb);
@@ -191,6 +200,12 @@ public:
   void testSystemMulticall_fail();
   void testSystemListMethods();
   void testSystemListNotifications();
+  void testGetCheckpointStatusControlFile();
+  void testGetCheckpointStatusRejectsMissingPath();
+#ifdef HAVE_SQLITE3
+  void testGetCheckpointStatusSqlite3();
+  void testCheckpointLookupWindowsSemantics();
+#endif // HAVE_SQLITE3
 #ifdef HAVE_SQLITE3
   void testSystemListMethodsExcludesSqlite3WhenDisabled();
   void testSaveSessionRpcWritesBothBackends();
@@ -1528,6 +1543,140 @@ void RpcMethodTest::testSystemListMethods()
     CPPUNIT_ASSERT_EQUAL(allNames[i], s->s());
   }
 }
+
+namespace {
+// Runs aria2.getCheckpointStatus for `path` and returns the result dict.
+const Dict* checkpointStatus(RpcResponse& res)
+{
+  CPPUNIT_ASSERT_EQUAL(0, res.code);
+  const Dict* d = downcast<Dict>(res.param);
+  CPPUNIT_ASSERT(d);
+  return d;
+}
+
+std::string dictString(const Dict* d, const char* key)
+{
+  const String* v = downcast<String>(d->get(key));
+  CPPUNIT_ASSERT_MESSAGE(key, v);
+  return v->s();
+}
+} // namespace
+
+void RpcMethodTest::testGetCheckpointStatusControlFile()
+{
+  // Without sqlite3 persistence the checkpoint is the classic control file
+  // named after the output path.
+  std::string dir = A2_TEST_OUT_DIR "/aria2_RpcMethodTest";
+  std::string resumable = dir + "/cp-present.bin.motrix";
+  std::string fresh = dir + "/cp-absent.bin.motrix";
+  { std::ofstream(resumable + ".aria2") << "ctrl"; }
+  std::remove((fresh + ".aria2").c_str());
+
+  GetCheckpointStatusRpcMethod m;
+  auto req = createReq(GetCheckpointStatusRpcMethod::getMethodName());
+  req.params->append(resumable);
+  auto res = m.execute(std::move(req), e_.get());
+  const Dict* d = checkpointStatus(res);
+  CPPUNIT_ASSERT_EQUAL(std::string("true"), dictString(d, "exists"));
+  CPPUNIT_ASSERT_EQUAL(std::string("control-file"), dictString(d, "store"));
+
+  auto req2 = createReq(GetCheckpointStatusRpcMethod::getMethodName());
+  req2.params->append(fresh);
+  auto res2 = m.execute(std::move(req2), e_.get());
+  CPPUNIT_ASSERT_EQUAL(std::string("false"),
+                       dictString(checkpointStatus(res2), "exists"));
+  std::remove((resumable + ".aria2").c_str());
+}
+
+void RpcMethodTest::testGetCheckpointStatusRejectsMissingPath()
+{
+  GetCheckpointStatusRpcMethod m;
+  auto res = m.execute(createReq(GetCheckpointStatusRpcMethod::getMethodName()),
+                       e_.get());
+  CPPUNIT_ASSERT_EQUAL(1, res.code);
+
+  auto req = createReq(GetCheckpointStatusRpcMethod::getMethodName());
+  req.params->append("");
+  auto res2 = m.execute(std::move(req), e_.get());
+  CPPUNIT_ASSERT_EQUAL(1, res2.code);
+}
+
+#ifdef HAVE_SQLITE3
+void RpcMethodTest::testGetCheckpointStatusSqlite3()
+{
+  // With sqlite3 persistence the engine reads task_progress, never the
+  // control file. The answer must come from that store (Motrix#2187).
+  std::string dbPath = std::string(A2_TEST_OUT_DIR) + "/checkpoint_status.db";
+  std::remove(dbPath.c_str());
+  std::remove((dbPath + "-wal").c_str());
+  std::remove((dbPath + "-shm").c_str());
+  auto store = make_unique<Sqlite3PersistenceStore>(dbPath);
+  store->open();
+  auto* storePtr = store.get();
+  e_->setSqlite3Store(std::move(store));
+
+  std::string dir = A2_TEST_OUT_DIR "/aria2_RpcMethodTest";
+  std::string saved = dir + "/sqlite-saved.bin.motrix";
+  std::string stray = dir + "/sqlite-stray.bin.motrix";
+  CPPUNIT_ASSERT_EQUAL(
+      SQLITE_OK,
+      sqlite3_exec(storePtr->raw(),
+                   ("INSERT INTO task_progress(gid, out_path, piece_length,"
+                    " total_length, bitfield, digest, updated_at) VALUES"
+                    " ('00000000000000aa', '" +
+                    saved + "', 1024, 2048, X'80', X'', 1)")
+                       .c_str(),
+                   nullptr, nullptr, nullptr));
+  // A leftover control file is not what this engine would read.
+  { std::ofstream(stray + ".aria2") << "ctrl"; }
+
+  GetCheckpointStatusRpcMethod m;
+  auto req = createReq(GetCheckpointStatusRpcMethod::getMethodName());
+  req.params->append(saved);
+  auto res = m.execute(std::move(req), e_.get());
+  const Dict* d = checkpointStatus(res);
+  CPPUNIT_ASSERT_EQUAL(std::string("true"), dictString(d, "exists"));
+  CPPUNIT_ASSERT_EQUAL(std::string("sqlite3"), dictString(d, "store"));
+
+  auto req2 = createReq(GetCheckpointStatusRpcMethod::getMethodName());
+  req2.params->append(stray);
+  auto res2 = m.execute(std::move(req2), e_.get());
+  CPPUNIT_ASSERT_EQUAL(std::string("false"),
+                       dictString(checkpointStatus(res2), "exists"));
+  std::remove((stray + ".aria2").c_str());
+}
+
+void RpcMethodTest::testCheckpointLookupWindowsSemantics()
+{
+  // aria2 joins --dir and --out with "/" whatever the platform, so a Windows
+  // front-end asking with "\\" separators — or a different letter case,
+  // which NTFS ignores — must still find the row.
+  std::string dbPath = std::string(A2_TEST_OUT_DIR) + "/checkpoint_win.db";
+  std::remove(dbPath.c_str());
+  std::remove((dbPath + "-wal").c_str());
+  std::remove((dbPath + "-shm").c_str());
+  Sqlite3PersistenceStore store(dbPath);
+  store.open();
+  CPPUNIT_ASSERT_EQUAL(
+      SQLITE_OK,
+      sqlite3_exec(store.raw(),
+                   "INSERT INTO task_progress(gid, out_path, piece_length,"
+                   " total_length, bitfield, digest, updated_at) VALUES"
+                   " ('00000000000000bb', 'C:\\Downloads/Setup.EXE.motrix',"
+                   " 1024, 2048, X'80', X'', 1)",
+                   nullptr, nullptr, nullptr));
+  CPPUNIT_ASSERT(Sqlite3BtProgressInfoFile::existsForPath(
+      store, "C:\\Downloads\\setup.exe.motrix", true));
+  CPPUNIT_ASSERT(Sqlite3BtProgressInfoFile::existsForPath(
+      store, "c:/downloads/SETUP.exe.motrix", true));
+  // POSIX semantics stay exact.
+  CPPUNIT_ASSERT(!Sqlite3BtProgressInfoFile::existsForPath(
+      store, "C:\\Downloads\\setup.exe.motrix", false));
+  CPPUNIT_ASSERT(Sqlite3BtProgressInfoFile::existsForPath(
+      store, "C:\\Downloads/Setup.EXE.motrix", false));
+  store.finalCheckpointAndClose();
+}
+#endif // HAVE_SQLITE3
 
 void RpcMethodTest::testSystemListNotifications()
 {

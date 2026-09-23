@@ -313,6 +313,75 @@ void migrate_v1_to_v2(Sqlite3PersistenceStore& store)
   });
 }
 
+void migrate_v2_to_v3(Sqlite3PersistenceStore& store)
+{
+  // Address checkpoints by output path, and detach them from `task`.
+  //
+  // v2 keyed task_progress by gid with ON DELETE CASCADE into task. That made
+  // the checkpoint die with its task row: removeDownloadResult on an errored
+  // download deleted the row and, through the cascade, the only record of
+  // which pieces were already on disk. A front-end retry also re-adds the
+  // download under a new gid, which a gid-keyed row can never match. The
+  // `.aria2` control file this table replaces has neither problem — it is
+  // named after the output file and outlives the task — so v3 restores those
+  // semantics (Motrix#2187).
+  //
+  // Existing rows keep out_path = NULL and remain reachable by gid; the first
+  // save of each rewrites it path-addressed. Unique out_path still admits any
+  // number of NULLs.
+  static const char* const sqls[] = {
+      "CREATE TABLE task_progress_v3 ("
+      "  gid              TEXT    NOT NULL,"
+      "  out_path         TEXT,"
+      "  ctrl_version     INTEGER NOT NULL DEFAULT 1,"
+      "  is_torrent       INTEGER NOT NULL DEFAULT 0,"
+      "  info_hash        BLOB,"
+      "  piece_length     INTEGER NOT NULL,"
+      "  total_length     INTEGER NOT NULL,"
+      "  upload_length    INTEGER NOT NULL DEFAULT 0,"
+      "  bitfield         BLOB    NOT NULL,"
+      "  in_flight_blob   BLOB    NOT NULL DEFAULT X'',"
+      "  digest           BLOB    NOT NULL,"
+      "  updated_at       INTEGER NOT NULL"
+      ");",
+
+      "INSERT INTO task_progress_v3"
+      " (gid, out_path, ctrl_version, is_torrent, info_hash, piece_length,"
+      "  total_length, upload_length, bitfield, in_flight_blob, digest,"
+      "  updated_at)"
+      " SELECT gid, NULL, ctrl_version, is_torrent, info_hash, piece_length,"
+      "        total_length, upload_length, bitfield, in_flight_blob, digest,"
+      "        updated_at"
+      " FROM task_progress;",
+
+      "DROP TABLE task_progress;",
+      "ALTER TABLE task_progress_v3 RENAME TO task_progress;",
+
+      "CREATE UNIQUE INDEX idx_task_progress_out_path"
+      " ON task_progress(out_path);",
+      "CREATE INDEX idx_task_progress_gid ON task_progress(gid);",
+
+      "UPDATE meta SET value = '3' WHERE key = 'schema_version';",
+      "PRAGMA user_version = 3;",
+  };
+
+  store.withTransaction([&]() {
+    for (const char* sql : sqls) {
+      char* errmsg = nullptr;
+      int rc = sqlite3_exec(store.raw(), sql, nullptr, nullptr, &errmsg);
+      if (rc != SQLITE_OK) {
+        std::string errstr;
+        if (errmsg) {
+          errstr = errmsg;
+          sqlite3_free(errmsg);
+        }
+        throw DL_ABORT_EX(fmt(
+            "sqlite3-persistence: migration step failed: %s", errstr.c_str()));
+      }
+    }
+  });
+}
+
 struct Migration {
   int from;
   int to;
@@ -322,6 +391,7 @@ struct Migration {
 static const Migration kMigrations[] = {
     {0, 1, &migrate_v0_to_v1},
     {1, 2, &migrate_v1_to_v2},
+    {2, 3, &migrate_v2_to_v3},
 };
 
 } // namespace

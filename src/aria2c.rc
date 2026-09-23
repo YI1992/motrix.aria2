@@ -1,0 +1,12 @@
+/* Windows resource script for aria2c.exe.
+ *
+ * Embeds the application manifest so the process is long-path aware; see
+ * aria2c.manifest for why. Built only on MinGW hosts (src/Makefile.am).
+ */
+#include <winuser.h>
+
+#ifndef CREATEPROCESS_MANIFEST_RESOURCE_ID
+#  define CREATEPROCESS_MANIFEST_RESOURCE_ID 1
+#endif
+
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "aria2c.manifest"
