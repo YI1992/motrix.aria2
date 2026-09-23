@@ -578,6 +578,19 @@ public:
   static const char* getMethodName() { return "aria2.saveSession"; }
 };
 
+// Reports whether the engine holds a resumable checkpoint for an output path,
+// from whichever store it reads: aria2.db under sqlite3 persistence, or the
+// `<path>.aria2` control file otherwise. A front-end asks before retrying a
+// partial download instead of reaching into either store itself.
+class GetCheckpointStatusRpcMethod : public RpcMethod {
+protected:
+  virtual std::unique_ptr<ValueBase> process(const RpcRequest& req,
+                                             DownloadEngine* e) CXX11_OVERRIDE;
+
+public:
+  static const char* getMethodName() { return "aria2.getCheckpointStatus"; }
+};
+
 class SystemMulticallRpcMethod : public RpcMethod {
 protected:
   virtual std::unique_ptr<ValueBase> process(const RpcRequest& req,

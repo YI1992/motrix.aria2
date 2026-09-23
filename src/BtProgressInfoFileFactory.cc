@@ -37,6 +37,7 @@
 #include "BtProgressInfoFile.h"
 #include "DefaultBtProgressInfoFile.h"
 #include "DownloadEngine.h"
+#include "File.h"
 
 #ifdef HAVE_SQLITE3
 #  include "Sqlite3BtProgressInfoFile.h"
@@ -57,6 +58,27 @@ makeBtProgressInfoFile(const std::shared_ptr<DownloadContext>& dctx,
   }
 #endif
   return std::make_shared<DefaultBtProgressInfoFile>(dctx, pieceStorage, option);
+}
+
+bool hasCheckpointForPath(const std::string& path, DownloadEngine* engine)
+{
+#ifdef HAVE_SQLITE3
+  if (engine && engine->getSqlite3Store()) {
+    return Sqlite3BtProgressInfoFile::existsForPath(*engine->getSqlite3Store(),
+                                                    path);
+  }
+#endif
+  return File(path + DefaultBtProgressInfoFile::getSuffix()).isFile();
+}
+
+const char* checkpointStoreName(DownloadEngine* engine)
+{
+#ifdef HAVE_SQLITE3
+  if (engine && engine->getSqlite3Store()) {
+    return "sqlite3";
+  }
+#endif
+  return "control-file";
 }
 
 } // namespace aria2

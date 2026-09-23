@@ -75,6 +75,20 @@ public:
   // checkpoint of a download the front-end removed together with its files.
   static void pruneDefunct(Sqlite3PersistenceStore& store);
 
+  // Whether a checkpoint is saved for this output path. `windowsPaths`
+  // compares separator- and case-insensitively: aria2 joins --dir and --out
+  // with "/" on every platform, and NTFS ignores letter case, so a front-end
+  // spelling the same path natively must still find it.
+  static bool existsForPath(Sqlite3PersistenceStore& store,
+                            const std::string& path,
+                            bool windowsPaths
+#ifdef __MINGW32__
+                            = true
+#else
+                            = false
+#endif
+  );
+
 #ifdef ENABLE_BITTORRENT
   void setBtRuntime(
       const std::shared_ptr<BtRuntime>& btRuntime) CXX11_OVERRIDE;

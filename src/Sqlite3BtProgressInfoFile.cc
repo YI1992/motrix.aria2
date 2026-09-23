@@ -36,6 +36,7 @@
 
 #ifdef HAVE_SQLITE3
 
+#include <algorithm>
 #include <cstring>
 #include <chrono>
 #include <vector>
@@ -189,6 +190,13 @@ const char* const kOrphanSql =
     " WHERE gid NOT IN (SELECT gid FROM task)";
 
 const char* const kDeleteRowSql = "DELETE FROM task_progress WHERE rowid = ?";
+
+const char* const kExistsByPathSql =
+    "SELECT 1 FROM task_progress WHERE out_path = ? LIMIT 1";
+
+const char* const kExistsByWindowsPathSql =
+    "SELECT 1 FROM task_progress"
+    " WHERE replace(out_path, '\\', '/') = ? COLLATE NOCASE LIMIT 1";
 
 // Binds ?1 = out_path (NULL when unresolved) and ?2 = gid.
 void bindIdentity(sqlite3_stmt* stmt, const std::string& outPath,
@@ -586,6 +594,28 @@ void Sqlite3BtProgressInfoFile::removeFile()
         fmt("sqlite3-persistence: DELETE task_progress failed: %s",
             sqlite3_errmsg(db)));
   }
+}
+
+bool Sqlite3BtProgressInfoFile::existsForPath(Sqlite3PersistenceStore& store,
+                                              const std::string& path,
+                                              bool windowsPaths)
+{
+  sqlite3* db = store.raw();
+  StmtGuard stmt;
+  if (sqlite3_prepare_v2(db,
+                         windowsPaths ? kExistsByWindowsPathSql
+                                      : kExistsByPathSql,
+                         -1, &stmt.stmt, nullptr) != SQLITE_OK) {
+    throw DL_ABORT_EX(fmt("sqlite3-persistence: prepare checkpoint lookup"
+                          " failed: %s",
+                          sqlite3_errmsg(db)));
+  }
+  std::string key = path;
+  if (windowsPaths) {
+    std::replace(key.begin(), key.end(), '\\', '/');
+  }
+  sqlite3_bind_text(stmt, 1, key.data(), key.size(), SQLITE_TRANSIENT);
+  return sqlite3_step(stmt) == SQLITE_ROW;
 }
 
 void Sqlite3BtProgressInfoFile::pruneDefunct(Sqlite3PersistenceStore& store)
