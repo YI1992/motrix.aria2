@@ -94,7 +94,7 @@ typename Parser::ResultType parseFile(Parser& parser,
 {
   int fd;
   // TODO Overrode a2open(const char*,..) and a2open(const std::wstring&,..)
-  while ((fd = a2open(utf8ToWChar(filename).c_str(), O_BINARY | O_RDONLY,
+  while ((fd = a2open(utf8ToWPath(filename).c_str(), O_BINARY | O_RDONLY,
                       OPEN_MODE)) == -1 &&
          errno == EINTR)
     ;

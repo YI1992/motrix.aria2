@@ -56,6 +56,8 @@
 #include <array>
 #include <cerrno>
 #include <cassert>
+#include <cctype>
+#include <cwchar>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -155,6 +157,52 @@ std::string toForwardSlash(const std::string& src)
   std::transform(std::begin(dst), std::end(dst), std::begin(dst),
                  [](char c) { return c == '\\' ? '/' : c; });
   return dst;
+}
+
+namespace {
+// CreateDirectoryW's limit: MAX_PATH minus room for an 8.3 file name. Rust
+// std and Go both switch to the \\?\ namespace at this length.
+constexpr size_t WIN32_LEGACY_MAX_PATH = 248;
+
+bool startsWith(const std::wstring& s, const wchar_t* prefix)
+{
+  return s.compare(0, wcslen(prefix), prefix) == 0;
+}
+
+bool isAbsoluteWin32(const std::wstring& p)
+{
+  auto sep = [](wchar_t c) { return c == L'\\' || c == L'/'; };
+  return (p.size() >= 3 && p[1] == L':' && sep(p[2]) && !sep(p[0])) ||
+         (p.size() >= 2 && sep(p[0]) && sep(p[1]));
+}
+} // namespace
+
+std::wstring utf8ToWPath(const std::string& path)
+{
+  auto wide = utf8ToWChar(path);
+  if (startsWith(wide, L"\\\\?\\") || startsWith(wide, L"\\??\\")) {
+    return wide;
+  }
+  if (wide.size() < WIN32_LEGACY_MAX_PATH && isAbsoluteWin32(wide)) {
+    return wide;
+  }
+  // Let Win32 itself resolve the path — relative parts, "/" separators,
+  // "." and "..", trailing dots and spaces — exactly as it would for a short
+  // path, so long and short spellings keep the same meaning.
+  DWORD size = GetFullPathNameW(wide.c_str(), 0, nullptr, nullptr);
+  if (size == 0) {
+    return wide;
+  }
+  std::wstring full(size, L'\0');
+  DWORD written = GetFullPathNameW(wide.c_str(), size, &full[0], nullptr);
+  if (written == 0 || written >= size) {
+    return wide;
+  }
+  full.resize(written);
+  if (full.size() + 1 < WIN32_LEGACY_MAX_PATH) {
+    return full;
+  }
+  return util::toWin32VerbatimPath(full);
 }
 
 #endif // __MINGW32__
@@ -2152,6 +2200,29 @@ std::string applyDir(const std::string& dir, const std::string& relPath)
   }
 #endif // __MINGW32__
   return s;
+}
+
+std::wstring toWin32VerbatimPath(const std::wstring& fullPath)
+{
+  auto startsWith = [&](const wchar_t* prefix) {
+    return fullPath.compare(0, wcslen(prefix), prefix) == 0;
+  };
+  if (startsWith(L"\\\\?\\") || startsWith(L"\\??\\")) {
+    return fullPath;
+  }
+  // C:\ => \\?\C:\ .
+  if (fullPath.size() >= 3 && fullPath[1] == L':' && fullPath[2] == L'\\') {
+    return L"\\\\?\\" + fullPath;
+  }
+  // \\.\ => \\?\ .
+  if (startsWith(L"\\\\.\\")) {
+    return L"\\\\?\\" + fullPath.substr(4);
+  }
+  // \\server\share => \\?\UNC\server\share .
+  if (startsWith(L"\\\\")) {
+    return L"\\\\?\\UNC\\" + fullPath.substr(2);
+  }
+  return fullPath;
 }
 
 std::string fixTaintedBasename(const std::string& src)

@@ -70,7 +70,7 @@ File& File::operator=(const File& c)
 
 int File::fillStat(a2_struct_stat& fstat)
 {
-  return a2stat(utf8ToWChar(name_).c_str(), &fstat);
+  return a2stat(utf8ToWPath(name_).c_str(), &fstat);
 }
 
 bool File::exists()
@@ -110,10 +110,10 @@ bool File::isDir()
 bool File::remove()
 {
   if (isFile()) {
-    return a2unlink(utf8ToWChar(name_).c_str()) == 0;
+    return a2unlink(utf8ToWPath(name_).c_str()) == 0;
   }
   else if (isDir()) {
-    return a2rmdir(utf8ToWChar(name_).c_str()) == 0;
+    return a2rmdir(utf8ToWPath(name_).c_str()) == 0;
   }
   else {
     return false;
@@ -127,7 +127,7 @@ HANDLE openFile(const std::string& filename, bool readOnly = true)
   DWORD desiredAccess = GENERIC_READ | (readOnly ? 0 : GENERIC_WRITE);
   DWORD sharedMode = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
   DWORD creationDisp = OPEN_EXISTING;
-  return CreateFileW(utf8ToWChar(filename).c_str(), desiredAccess, sharedMode,
+  return CreateFileW(utf8ToWPath(filename).c_str(), desiredAccess, sharedMode,
                      /* lpSecurityAttributes */ nullptr, creationDisp,
                      FILE_ATTRIBUTE_NORMAL, /* hTemplateFile */ nullptr);
 }
@@ -236,7 +236,7 @@ bool File::mkdirs()
       A2_LOG_DEBUG(fmt("%s exists and is a directory.", dir.c_str()));
       continue;
     }
-    if (a2mkdir(utf8ToWChar(dir).c_str(), DIR_OPEN_MODE) == -1) {
+    if (a2mkdir(utf8ToWPath(dir).c_str(), DIR_OPEN_MODE) == -1) {
       A2_LOG_DEBUG(fmt("Failed to create %s", dir.c_str()));
       return false;
     }
@@ -293,7 +293,7 @@ bool File::renameTo(const std::string& dest)
   // MinGW's rename() doesn't delete an existing destination.  Better
   // to use MoveFileEx, which usually provides atomic move in aria2
   // usecase.
-  if (MoveFileExW(utf8ToWChar(name_).c_str(), utf8ToWChar(dest).c_str(),
+  if (MoveFileExW(utf8ToWPath(name_).c_str(), utf8ToWPath(dest).c_str(),
                   MOVEFILE_COPY_ALLOWED | MOVEFILE_REPLACE_EXISTING)) {
     name_ = dest;
     return true;
@@ -359,7 +359,7 @@ bool File::utime(const Time& actime, const Time& modtime) const
   a2utimbuf ub;
   ub.actime = actime.getTimeFromEpoch();
   ub.modtime = modtime.getTimeFromEpoch();
-  return a2utime(utf8ToWChar(name_).c_str(), &ub) == 0;
+  return a2utime(utf8ToWPath(name_).c_str(), &ub) == 0;
 #endif // !defined(HAVE_UTIMES) && !defined(__MINGW32__)
 }
 

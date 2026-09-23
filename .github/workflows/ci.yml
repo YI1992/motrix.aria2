@@ -179,6 +179,19 @@ jobs:
           Format-List | Out-File "$resultDir/binary-sha256.txt"
         (& .\bin\aria2c.exe --version 2>&1 | Out-String) |
           Out-File "$resultDir/version.txt"
+    - name: Verify destinations longer than MAX_PATH
+      shell: pwsh
+      env:
+        ARIA2_E2E_BIN: ${{ github.workspace }}\bin\aria2c.exe
+        LONG_PATHS_POLICY_OFF: '1'
+      run: |
+        # Turn the machine policy off so only the \\?\ namespace can make a
+        # >260-character destination work (agalwood/Motrix#2183). aria2c reads
+        # the policy at process start, and the test spawns it afterwards.
+        reg add HKLM\SYSTEM\CurrentControlSet\Control\FileSystem /v LongPathsEnabled /t REG_DWORD /d 0 /f
+        if ($LASTEXITCODE -ne 0) { throw 'could not turn LongPathsEnabled off' }
+        node --test test/e2e/windows-long-path.e2e.test.mjs
+        if ($LASTEXITCODE -ne 0) { throw 'long-path download failed' }
     - name: Verify persistent WebSocket RPC
       env:
         ARIA2_E2E_BIN: ${{ github.workspace }}\bin\aria2c.exe
