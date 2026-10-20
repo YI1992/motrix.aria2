@@ -1,8 +1,9 @@
 import { after, before, describe, it } from 'node:test'
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { createServer, request as forwardHttp } from 'node:http'
-import { chmod, copyFile, link, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { chmod, copyFile, link, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm, stat, symlink, writeFile as fsWriteFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -10,6 +11,13 @@ import { gunzipSync, gzipSync } from 'node:zlib'
 import { allocPorts, spawnAria2, stopInstance } from './helpers/aria2-process.mjs'
 import { Aria2Rpc } from './helpers/rpc-client.mjs'
 import { encode } from './helpers/bencode.mjs'
+const windows=process.platform==='win32'
+const nativePath=p=>windows?p.replaceAll('\\','/'):p
+let windowsOwner
+async function writeFile(filename, ...args) {
+  await fsWriteFile(filename, ...args)
+  if(windows)execFileSync('icacls.exe',[path.toNamespacedPath(filename),'/setowner',`*${windowsOwner}`])
+}
 const secret='legacy-fixture-secret', payload=Buffer.alloc(98305,0x63)
 const previousBin=process.env.ARIA2_SCHEMA4_BIN || process.env.ARIA2_SCHEMA3_BIN
 const previousSchema=process.env.ARIA2_SCHEMA4_BIN ? 4 : 3
@@ -39,12 +47,22 @@ async function engine(t,dir,{ sqlite=true, auth=true, bin, extra=[] }={}) {
     '--split=1','--max-connection-per-server=1','--max-tries=1','--seed-time=0','--pause=true',...extra,
   ]});t.after(()=>stopInstance(proc));const rpc=new Aria2Rpc({port:rpcPort,secret:auth?secret:''})
   await until(()=>rpc.call('aria2.getVersion').catch(()=>null),Boolean)
-  return {rpc,dir,listenPort,stop:signal=>stopInstance(proc,signal)}
+  return {rpc,dir,listenPort,stop:async signal=>{
+    if(signal==='graceful') {
+      // Node SIGTERM terminates Windows processes; use the real shutdown RPC
+      // to distinguish normal persistence/cleanup from TerminateProcess.
+      await rpc.call('aria2.shutdown')
+      await until(async()=>proc.exitCode!==null||proc.signalCode!==null,Boolean,15000)
+      assert.equal(proc.exitCode,0)
+      return
+    }
+    return stopInstance(proc,signal)
+  }}
 }
 function db(e,fn){const d=new DatabaseSync(`${e.dir}/session.db`);try{d.exec('PRAGMA busy_timeout=5000');return fn(d)}finally{d.close()}}
 function count(e,table){return db(e,d=>d.prepare(`SELECT count(*) AS n FROM ${table}`).get().n)}
-async function request(e,name,{ bytes=control(), data=payload, gid='1234567890abcdef', token=`legacy_test_${name}_token` }={}) {
-  const target=path.join(e.dir,`${name}.bin`);await writeFile(target,data,{mode:0o600})
+async function request(e,name,{ bytes=control(), data=payload, gid='1234567890abcdef', token=`legacy_test_${sha(Buffer.from(name)).slice(0,32)}_token` }={}) {
+  const target=nativePath(path.join(e.dir,`${name}.bin`));await writeFile(target,data,{mode:0o600})
   const s=await stat(target,{bigint:true});const observed=await e.rpc.call(inspect,[{controlFile:bytes.toString('base64')}])
   return {token,gid,controlFile:bytes.toString('base64'),controlDigest:sha(bytes),targetPath:target,
     expected:{kind:observed.kind,totalLength:observed.totalLength,pieceLength:observed.pieceLength,infoHash:observed.infoHash},
@@ -171,7 +189,7 @@ async function durableBtRequest(e,name) {
       'seed-time':'0','seed-ratio':'0','rpc-save-upload-metadata':'false'}}}
 }
 
-async function dropActivationResponse(t,e,activation) {
+async function dropActivationResponse(t,e,activation,method='aria2.addLegacyTorrentV1') {
   // Forward the actual RPC, then close the client socket as soon as the
   // engine sends response headers. The caller sees transport failure even
   // though the engine has already met its durable-before-response contract.
@@ -188,11 +206,20 @@ async function dropActivationResponse(t,e,activation) {
   await new Promise(r=>proxy.listen(0,'127.0.0.1',r))
   t.after(async()=>{proxy.closeAllConnections();await new Promise(r=>proxy.close(r))})
   const client=new Aria2Rpc({port:proxy.address().port,secret})
-  await assert.rejects(client.call('aria2.addLegacyTorrentV1',[activation]),/fetch failed|socket|terminated/)
-  const actual=await acknowledged;assert.equal(actual.result,activation.options.gid,JSON.stringify(actual))
+  await assert.rejects(client.call(method,[activation]),/fetch failed|socket|terminated/)
+  const actual=await acknowledged
+  if(method==='aria2.addLegacyTorrentV1')assert.equal(actual.result,activation.options.gid,JSON.stringify(actual))
+  else assert.equal(actual.result?.status,'created',JSON.stringify(actual))
+  return actual.result
 }
 before(async()=>{
-  root=await realpath(await mkdtemp(path.join(tmpdir(),'aria2-legacy-import-')))
+  root=nativePath(await realpath(await mkdtemp(path.join(tmpdir(),'aria2-legacy-import-'))))
+  if(windows) {
+    const sid=windowsOwner=execFileSync('powershell.exe',['-NoProfile','-Command','[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value'],{encoding:'utf8'}).trim()
+    execFileSync('icacls.exe',[root,'/inheritance:r','/grant:r',`*${sid}:(OI)(CI)F`,'*S-1-5-18:(OI)(CI)F','*S-1-5-32-544:(OI)(CI)F'])
+    // Elevated runner tokens can default the owner to Administrators.
+    execFileSync('icacls.exe',[root,'/setowner',`*${sid}`])
+  }
   nativeControl=await readFile(new URL('partial.bin.aria2',fixture));nativePartial=gunzipSync(await readFile(new URL('partial.bin.gz',fixture)))
   server=createServer((req,res)=>{requests.push({url:req.url,range:req.headers.range});
     if(req.url==='/chunked'){res.writeHead(200,{'transfer-encoding':'chunked'});res.end(nativePayload);return}
@@ -205,6 +232,72 @@ before(async()=>{
 })
 after(async()=>{await new Promise(r=>server.close(r));if(process.env.ARIA2_E2E_KEEP_TMP)console.log(`workDir kept: ${root}`);else await rm(root,{recursive:true,force:true})})
 describe('legacy checkpoint engine import',()=>{
+  it('imports Unicode and long canonical paths without changing payload bytes',async t=>{
+    const e=await engine(t,`${root}/windows-long`)
+    const name=`下载-данные/${'deep-directory/'.repeat(20)}partial`
+    await mkdir(path.dirname(`${e.dir}/${name}.bin`),{recursive:true})
+    const req=await request(e,name)
+    assert.ok(req.targetPath.length>260)
+    const original=await readFile(req.targetPath)
+    const result=await e.rpc.call(importMethod,[req])
+    assert.equal(result.status,'created')
+    assert.deepEqual(await e.rpc.call(reconcile,[query(req)]),result)
+    assert.deepEqual(await readFile(req.targetPath),original)
+  })
+  it('rejects Windows junctions, aliases, ADS, foreign owners and open writers',{skip:!windows},async t=>{
+    const e=await engine(t,`${root}/windows-safety`),req=await request(e,'safe')
+    const original=await readFile(req.targetPath)
+    const junction=`${root}/junction`;await symlink(e.dir,junction,'junction')
+    const alias=`${junction}/safe.bin`
+    for(const target of [alias,req.targetPath.toLowerCase(),`${req.targetPath}:stream`,
+      `${e.dir}/safe.bin.`,`${e.dir}/CON`,`${e.dir}/COM¹.txt`,`${e.dir}/CON .txt`,req.targetPath.replaceAll('/','\\')]) {
+      await assert.rejects(e.rpc.call(importMethod,[{...req,targetPath:target,files:[{...req.files[0],path:target}]}]))
+    }
+    execFileSync('icacls.exe',[req.targetPath,'/setowner','*S-1-5-32-544'])
+    await assert.rejects(e.rpc.call(importMethod,[req]),/exclusively owned/)
+    execFileSync('icacls.exe',[req.targetPath,'/setowner',`*${windowsOwner}`])
+    const writer=await open(req.targetPath,'r+')
+    try { await assert.rejects(e.rpc.call(importMethod,[req]),/safe path/) }
+    finally { await writer.close() }
+    assert.equal(count(e,'task_progress'),0)
+    assert.deepEqual(await readFile(req.targetPath),original)
+  })
+  it('holds Windows payload and ancestor handles against replacement through commit',{skip:!windows},async t=>{
+    const e=await engine(t,`${root}/windows-race`,{extra:['--save-session-interval=0']})
+    const parent=`${e.dir}/payload`;await mkdir(parent)
+    const req=await request(e,'payload/safe')
+    const blocker=new DatabaseSync(`${e.dir}/session.db`)
+    blocker.exec('BEGIN IMMEDIATE')
+    const importing=e.rpc.call(importMethod,[req])
+    let importError
+    importing.catch(error=>{importError=error}) // Awaited after releasing the DB lock.
+    // Hold the commit transaction busy after read-only validation. Observe the
+    // actual Windows sharing denial before attempting both replacement forms.
+    try {
+      await until(async()=>{
+        if(importError)throw importError
+        return readFile(`${e.dir}/engine.log`,'utf8')
+      },log=>log.includes('Legacy checkpoint payload handles validated; awaiting commit'),3000)
+      await assert.rejects(open(req.targetPath,'r+').then(handle=>handle.close()))
+      await assert.rejects(rename(req.targetPath,`${req.targetPath}.replaced`))
+      await assert.rejects(rename(parent,`${parent}.replaced`))
+      await assert.rejects(writeFile(req.targetPath,Buffer.from('external mutation')))
+    } finally { blocker.exec('ROLLBACK');blocker.close() }
+    assert.equal((await importing).status,'created')
+    assert.deepEqual(await readFile(req.targetPath),payload)
+    assert.equal((await e.rpc.call(reconcile,[query(req)])).status,'created')
+  })
+  it('reconciles a lost import response after process termination without duplicating progress',async t=>{
+    const dir=`${root}/lost-import`;let e=await engine(t,dir)
+    const req=await request(e,'lost-import')
+    const result=await dropActivationResponse(t,e,req,importMethod)
+    await e.stop('SIGKILL');e=await engine(t,dir)
+    assert.deepEqual(await e.rpc.call(reconcile,[query(req)]),result)
+    assert.deepEqual(await e.rpc.call(importMethod,[req]),result)
+    assert.equal(count(e,'task_progress'),1)
+    assert.equal(count(e,'legacy_checkpoint_import'),1)
+    assert.deepEqual(await readFile(req.targetPath),payload)
+  })
   it('inspects native bitfields and partial blocks without database, file or network mutation',async t=>{
     const e=await engine(t,`${root}/inspect`);const bytes=control(),originalRequests=requests.length
     const result=await e.rpc.call(inspect,[{controlFile:bytes.toString('base64')}])
@@ -247,9 +340,15 @@ describe('legacy checkpoint engine import',()=>{
       {...req,files:[{...req.files[0],identity:{...req.files[0].identity,size:'900719925474099999999'}}]},
       {...req,expected:{...req.expected,totalLength:'98306'}}]
     for(const bad of variants)await assert.rejects(e.rpc.call(importMethod,[bad]))
+    await assert.rejects(e.rpc.call(importMethod,[{...req,files:[{...req.files[0],identity:{...req.files[0].identity,inode:'18446744073709551616'}}]}]),/overflow/)
+    await assert.rejects(e.rpc.call(importMethod,[{...req,files:[{...req.files[0],identity:{...req.files[0].identity,inode:'18446744073709551615'}}]}]),/identity changed/)
     const sym=`${e.dir}/alias.bin`;await symlink(req.targetPath,sym);await assert.rejects(e.rpc.call(importMethod,[{...req,targetPath:sym,files:[{...req.files[0],path:sym}]}]),/safe path/)
     await link(req.targetPath,`${e.dir}/hard.bin`);await assert.rejects(e.rpc.call(importMethod,[req]),/exclusively owned/);await rm(`${e.dir}/hard.bin`)
-    await chmod(req.targetPath,0o666);await assert.rejects(e.rpc.call(importMethod,[req]),/exclusively owned/);await chmod(req.targetPath,0o600)
+    if(windows)execFileSync('icacls.exe',[req.targetPath,'/grant','*S-1-1-0:W'])
+    else await chmod(req.targetPath,0o666)
+    await assert.rejects(e.rpc.call(importMethod,[req]),/exclusively owned/)
+    if(windows)execFileSync('icacls.exe',[req.targetPath,'/remove:g','*S-1-1-0'])
+    else await chmod(req.targetPath,0o600)
     await rename(req.targetPath,`${req.targetPath}.old`);await writeFile(req.targetPath,payload,{mode:0o600});await assert.rejects(e.rpc.call(importMethod,[req]),/identity changed/)
     assert.equal(count(e,'task_progress'),0)
   })
@@ -335,7 +434,7 @@ describe('legacy checkpoint engine import',()=>{
     t.diagnostic('baseline reproduced: ordinary addTorrent + rpc-save-upload-metadata=false loses paused task on restart')
   })
   it('atomically binds a read-only metadata reference and restores a lost paused RPC across shutdown and SIGKILL',async t=>{
-    for(const signal of ['SIGTERM','SIGKILL']) {
+    for(const signal of ['graceful','SIGKILL']) {
       const dir=`${root}/bt-durable-${signal}`;let e=await engine(t,dir,{extra:['--save-session-interval=0']})
       const state=await durableBtRequest(e,signal),before=await readFile(state.legacyMetadata)
       assert.ok((await e.rpc.call('aria2.getVersion')).enabledFeatures.includes('LegacyTorrentMetadataV1'))

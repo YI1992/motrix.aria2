@@ -32,7 +32,17 @@
  * files in the program, then also delete it here.
  */
 /* copyright --> */
+#ifdef __MINGW32__
+#  undef _WIN32_WINNT
+#  define _WIN32_WINNT 0x0600
+#  undef WINVER
+#  define WINVER 0x0600
+#endif
 #include "LegacyCheckpointImport.h"
+#ifdef __MINGW32__
+#  include <windows.h>
+#  include <aclapi.h>
+#endif
 #include "LegacyCheckpointCodec.h"
 #include "RpcMethodImpl.h"
 #include "DownloadEngine.h"
@@ -73,13 +83,17 @@
 #endif
 #if defined(HAVE_SQLITE3) && !defined(__MINGW32__) && defined(O_NOFOLLOW) &&   \
     defined(O_DIRECTORY)
-#  define LEGACY_SAFE_POSIX 1
+#  define LEGACY_SAFE_FILES 1
+#endif
+
+#if defined(HAVE_SQLITE3) && defined(__MINGW32__)
+#  define LEGACY_SAFE_FILES 1
 #endif
 
 namespace aria2 {
 bool legacyCheckpointImportAvailable(DownloadEngine* e)
 {
-#ifdef LEGACY_SAFE_POSIX
+#ifdef LEGACY_SAFE_FILES
   return e && e->getSqlite3Store() && e->getSqlite3Store()->raw() &&
          !e->getOption()->get(PREF_RPC_SECRET).empty() &&
          MessageDigest::supports("sha-256");
@@ -89,7 +103,7 @@ bool legacyCheckpointImportAvailable(DownloadEngine* e)
 }
 bool legacyTorrentMetadataAvailable(DownloadEngine* e)
 {
-#if defined(LEGACY_SAFE_POSIX) && defined(ENABLE_BITTORRENT)
+#if defined(LEGACY_SAFE_FILES) && defined(ENABLE_BITTORRENT)
   return legacyCheckpointImportAvailable(e) && e->getSqlite3SessionStore();
 #else
   return false;
@@ -116,6 +130,18 @@ int64_t decimal(const Dict* d, const char* key)
   }
   return result;
 }
+void identityNumber(const Dict* d, const char* key)
+{
+  const auto& s = stringField(d, key);
+  if (s.empty() || s.size() > 20 || (s.size() > 1 && s[0] == '0'))
+    throw DL_ABORT_EX("Legacy checkpoint invalid identity number");
+  uint64_t value = 0;
+  for (auto c : s) {
+    if (c < '0' || c > '9' || value > (UINT64_MAX - (c - '0')) / 10)
+      throw DL_ABORT_EX("Legacy checkpoint identity number overflow");
+    value = value * 10 + c - '0';
+  }
+}
 void checkToken(const std::string& s)
 {
   if (s.size() < 16 || s.size() > 128)
@@ -127,27 +153,67 @@ void checkToken(const std::string& s)
 }
 void checkPath(const std::string& p)
 {
+#ifdef __MINGW32__
+  // The wire/native key uses forward slashes. Device, UNC and drive-relative
+  // names are not local NTFS paths and must never reach CreateFileW.
+  if (p.size() < 4 || p.size() > 4096 || p[0] < 'A' || p[0] > 'Z' ||
+      p[1] != ':' || p[2] != '/' || p.back() == '/')
+    throw DL_ABORT_EX("Legacy checkpoint requires canonical absolute path");
+  size_t start = 3;
+#else
   if (p.size() < 2 || p.size() > 4096 || p[0] != '/' || p.back() == '/')
     throw DL_ABORT_EX("Legacy checkpoint requires canonical absolute path");
   size_t start = 1;
-  for (size_t i = 1; i <= p.size(); ++i) {
+#endif
+  for (size_t i = start; i <= p.size(); ++i) {
     if (i < p.size() && (static_cast<unsigned char>(p[i]) < 32 || p[i] == 127))
       throw DL_ABORT_EX("Legacy checkpoint invalid path character");
     if (i == p.size() || p[i] == '/') {
       auto part = p.substr(start, i - start);
       if (part.empty() || part == "." || part == "..")
         throw DL_ABORT_EX("Legacy checkpoint invalid path component");
+#ifdef __MINGW32__
+      if (part.back() == '.' || part.back() == ' ' ||
+          part.find_first_of("\\:<>\"|?*") != std::string::npos)
+        throw DL_ABORT_EX("Legacy checkpoint invalid Windows path component");
+      auto stem = part.substr(0, part.find('.'));
+      while (!stem.empty() && stem.back() == ' ') stem.pop_back();
+      for (auto& ch : stem) if (ch >= 'a' && ch <= 'z') ch -= 'a' - 'A';
+      if (stem == "CON" || stem == "PRN" || stem == "AUX" || stem == "NUL" ||
+          stem == "CONIN$" || stem == "CONOUT$" || stem == "CLOCK$" ||
+          (stem.size() == 4 && (stem.compare(0, 3, "COM") == 0 ||
+                               stem.compare(0, 3, "LPT") == 0) &&
+           stem[3] >= '0' && stem[3] <= '9') ||
+          (stem.size() == 5 && (stem.compare(0, 3, "COM") == 0 ||
+                               stem.compare(0, 3, "LPT") == 0) &&
+           static_cast<unsigned char>(stem[3]) == 0xc2 &&
+           (static_cast<unsigned char>(stem[4]) == 0xb9 ||
+            static_cast<unsigned char>(stem[4]) == 0xb2 ||
+            static_cast<unsigned char>(stem[4]) == 0xb3)))
+        throw DL_ABORT_EX("Legacy checkpoint reserved Windows path component");
+#endif
       start = i + 1;
     }
   }
 }
 bool overlaps(const std::string& a, const std::string& b)
 {
+#ifdef __MINGW32__
+  auto aw = utf8ToWChar(toForwardSlash(a));
+  auto bw = utf8ToWChar(toForwardSlash(b));
+  auto prefix = [](const std::wstring& x, const std::wstring& y) {
+    return x.size() >= y.size() &&
+           CompareStringOrdinal(x.data(), y.size(), y.data(), y.size(), TRUE) == CSTR_EQUAL &&
+           (x.size() == y.size() || x[y.size()] == L'/');
+  };
+  return prefix(aw, bw) || prefix(bw, aw);
+#else
   return a == b ||
          (a.size() > b.size() && a.compare(0, b.size(), b) == 0 &&
           a[b.size()] == '/') ||
          (b.size() > a.size() && b.compare(0, a.size(), a) == 0 &&
           b[a.size()] == '/');
+#endif
 }
 LegacyCheckpoint snapshot(const Dict* d)
 {
@@ -187,7 +253,7 @@ std::unique_ptr<Dict> inspection(const LegacyCheckpoint& c)
   result->put("ranges", std::move(ranges));
   return result;
 }
-#ifdef LEGACY_SAFE_POSIX
+#ifdef LEGACY_SAFE_FILES
 struct Identity {
   std::string device, inode, size, mtime, ctime;
   bool operator==(const Identity& o) const
@@ -196,6 +262,9 @@ struct Identity {
            mtime == o.mtime && ctime == o.ctime;
   }
 };
+#ifdef __MINGW32__
+#  include "LegacyCheckpointWindows.h"
+#else
 Identity identity(const struct stat& st)
 {
   if (!S_ISREG(st.st_mode) || st.st_uid != geteuid() || st.st_nlink != 1 ||
@@ -265,6 +334,11 @@ Identity statHandle(int fd)
     throw DL_ABORT_EX("Legacy checkpoint payload stat failed");
   return identity(st);
 }
+ssize_t readHandle(int fd, char* buffer, size_t length, size_t offset)
+{
+  return pread(fd, buffer, length, offset);
+}
+#endif
 struct FileSpec {
   std::string path;
   int64_t offset, length, size;
@@ -308,9 +382,11 @@ std::vector<FileSpec> fileSpecs(const Dict* request, const LegacyCheckpoint& c,
     auto i = downcast<Dict>(d->get("identity"));
     if (!i || i->size() != 5)
       throw DL_ABORT_EX("Legacy checkpoint invalid file identity");
-    // Canonical, signed 64-bit decimal values throughout the wire contract.
-    for (auto key : {"device", "inode", "size", "mtimeNs", "ctimeNs"})
-      decimal(i, key);
+    // Native file IDs are unsigned (including NTFS sequence bits); lengths
+    // and Unix nanosecond timestamps retain the signed v1 numeric bound.
+    identityNumber(i, "device");
+    identityNumber(i, "inode");
+    for (auto key : {"size", "mtimeNs", "ctimeNs"}) decimal(i, key);
     Identity expected{stringField(i, "device"), stringField(i, "inode"),
                       stringField(i, "size"), stringField(i, "mtimeNs"),
                       stringField(i, "ctimeNs")};
@@ -431,7 +507,7 @@ MetadataSnapshot readMetadata(const std::string& path,
   metadata.bytes.resize(length);
   size_t offset = 0;
   while (offset < metadata.bytes.size()) {
-    auto read = pread(metadata.handle.fd, &metadata.bytes[offset],
+    auto read = readHandle(metadata.handle.fd, &metadata.bytes[offset],
                       metadata.bytes.size() - offset, offset);
     if (read < 0 && errno == EINTR) {
       continue;
@@ -630,12 +706,26 @@ void checkConflicts(DownloadEngine* e, const std::string& gid,
 {
   auto& man = e->getRequestGroupMan();
   auto ownedInode = [&](const std::string& path) {
+#ifdef __MINGW32__
+    auto native = utf8ToWPath(path);
+    Handle handle(CreateFileW(native.c_str(), FILE_READ_ATTRIBUTES,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                              nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS,
+                              nullptr));
+    BY_HANDLE_FILE_INFORMATION st;
+    if (handle.fd != INVALID_HANDLE_VALUE && GetFileInformationByHandle(handle.fd, &st))
+      for (const auto& f : files)
+        if (util::uitos(st.dwVolumeSerialNumber) == f.expected.device &&
+            util::uitos((uint64_t(st.nFileIndexHigh) << 32) | st.nFileIndexLow) == f.expected.inode)
+          return true;
+#else
     struct stat st;
     if (!stat(path.c_str(), &st))
       for (const auto& f : files)
         if (util::uitos(st.st_dev) == f.expected.device &&
             util::uitos(st.st_ino) == f.expected.inode)
           return true;
+#endif
     return false;
   };
   auto checkPaths =
@@ -709,14 +799,14 @@ void checkConflicts(DownloadEngine* e, const std::string& gid,
       throw DL_ABORT_EX("Legacy checkpoint inode database conflict");
   }
 }
-#endif // LEGACY_SAFE_POSIX
+#endif // LEGACY_SAFE_FILES
 } // namespace
 
 #ifdef HAVE_SQLITE3
 void validateLegacyTorrentMetadata(Sqlite3PersistenceStore& store,
                                    const std::string& gid)
 {
-#  if defined(LEGACY_SAFE_POSIX) && defined(ENABLE_BITTORRENT)
+#  if defined(LEGACY_SAFE_FILES) && defined(ENABLE_BITTORRENT)
   Statement reference(store.raw(), METADATA_REFERENCE_SQL);
   reference.text(1, gid);
   if (reference.row()) {
@@ -747,7 +837,7 @@ bool restoreLegacyTorrentTask(Sqlite3PersistenceStore& store,
                               const std::shared_ptr<Option>& option,
                               std::vector<std::shared_ptr<RequestGroup>>& out)
 {
-#  if defined(LEGACY_SAFE_POSIX) && defined(ENABLE_BITTORRENT)
+#  if defined(LEGACY_SAFE_FILES) && defined(ENABLE_BITTORRENT)
   Statement reference(store.raw(), METADATA_REFERENCE_SQL);
   reference.text(1, gid);
   if (!reference.row()) {
@@ -808,7 +898,7 @@ bool restoreLegacyTorrentTask(Sqlite3PersistenceStore& store,
 bool legacyCheckpointPending(Sqlite3PersistenceStore& store,
                              const std::string& path)
 {
-#  ifdef LEGACY_SAFE_POSIX
+#  ifdef LEGACY_SAFE_FILES
   Statement s(
       store.raw(),
       "SELECT gid,progress_digest,control_digest FROM "
@@ -840,7 +930,7 @@ void consumeLegacyCheckpoint(Sqlite3PersistenceStore& store,
                              const std::string& path, DownloadContext& context,
                              bool consume)
 {
-#  ifdef LEGACY_SAFE_POSIX
+#  ifdef LEGACY_SAFE_FILES
   Statement s(
       store.raw(),
       "SELECT token,progress_digest,gid,control_digest,consumed FROM "
@@ -850,6 +940,7 @@ void consumeLegacyCheckpoint(Sqlite3PersistenceStore& store,
     return;
   auto token = s.column(0), digest = s.column(1), gid = s.column(2),
        controlDigest = s.column(3);
+  std::vector<Handle> payloadHandles;
   store.withTransaction([&]() {
     Statement p(store.raw(), CHECKPOINT_PROOF_SQL);
     p.text(1, path);
@@ -904,6 +995,7 @@ void consumeLegacyCheckpoint(Sqlite3PersistenceStore& store,
       if (!(statHandle(handle.fd) == expected))
         throw DL_ABORT_EX(
             "Legacy checkpoint payload changed before restoration");
+      payloadHandles.push_back(std::move(handle));
     }
     if (matched != context.getFileEntries().size())
       throw DL_ABORT_EX("Legacy checkpoint native task file map mismatch");
@@ -929,7 +1021,7 @@ AddLegacyTorrentV1RpcMethod::process(const RpcRequest& req, DownloadEngine* e)
   if (!legacyTorrentMetadataAvailable(e)) {
     throw DL_ABORT_EX("LegacyTorrentMetadataV1 unavailable");
   }
-#  ifdef LEGACY_SAFE_POSIX
+#  ifdef LEGACY_SAFE_FILES
   auto d = checkRequiredParam<Dict>(req, 0);
   if (req.params->size() != 1 || d->size() != 6) {
     throw DL_ABORT_EX("Legacy torrent invalid activation request");
@@ -1047,7 +1139,7 @@ ReconcileLegacyCheckpointV1RpcMethod::process(const RpcRequest& req,
                                               DownloadEngine* e)
 {
   requireAvailable(e);
-#ifdef LEGACY_SAFE_POSIX
+#ifdef LEGACY_SAFE_FILES
   auto d = checkRequiredParam<Dict>(req, 0);
   if (req.params->size() != 1 || d->size() != 2)
     throw DL_ABORT_EX("Legacy checkpoint invalid reconciliation request");
@@ -1064,7 +1156,7 @@ ImportLegacyCheckpointV1RpcMethod::process(const RpcRequest& req,
                                            DownloadEngine* e)
 {
   requireAvailable(e);
-#ifdef LEGACY_SAFE_POSIX
+#ifdef LEGACY_SAFE_FILES
   auto d = checkRequiredParam<Dict>(req, 0);
   if (req.params->size() != 1 || d->size() != 7)
     throw DL_ABORT_EX("Legacy checkpoint invalid import request");
@@ -1092,6 +1184,7 @@ ImportLegacyCheckpointV1RpcMethod::process(const RpcRequest& req,
   if (stringField(existing.get(), "status") != "absent")
     return existing;
   files = fileSpecs(d, c, target, true);
+  A2_LOG_DEBUG("Legacy checkpoint payload handles validated; awaiting commit");
   store->withTransaction([&]() {
     checkConflicts(e, gid, target, files);
     verifyFiles(files);
