@@ -1,0 +1,24 @@
+--- src/LibsslTLSContext.cc	2026-10-25 00:40:38.000000000 +0800
++++ b/LibsslTLSContext.cc	2026-10-25 09:52:34.167110600 +0800
+@@ -41,7 +41,7 @@
+ #include <openssl/pkcs12.h>
+ #include <openssl/bio.h>
+ #include <openssl/x509_vfy.h>
+-#include <openssl/x509err.h>
++/* #include <openssl/x509err.h> */
+ 
+ #if defined(__APPLE__)
+ #  include <CoreFoundation/CoreFoundation.h>
+--- src/LibsslTLSContext.cc	2026-10-25 16:59:06.000000000 +0800
++++ b/LibsslTLSContext.cc	2026-11-01 22:18:31.712899100 +0800
+@@ -40,8 +40,8 @@
+ #include <openssl/err.h>
+ #include <openssl/pkcs12.h>
+ #include <openssl/bio.h>
+-#include <openssl/x509_vfy.h>
+-#include <openssl/x509err.h>
++/* #include <openssl/x509_vfy.h>
++#include <openssl/x509err.h> */
+ 
+ #if defined(__APPLE__)
+ #  include <CoreFoundation/CoreFoundation.h>
